@@ -30,6 +30,7 @@ pub struct WeixinClient {
 pub struct WeixinClientBuilder {
     config: WeixinConfig,
     handler: Option<Arc<dyn MessageHandler>>,
+    cancel: CancellationToken,
 }
 
 impl WeixinClient {
@@ -38,6 +39,7 @@ impl WeixinClient {
         WeixinClientBuilder {
             config,
             handler: None,
+            cancel: CancellationToken::new(),
         }
     }
 
@@ -110,6 +112,12 @@ impl WeixinClientBuilder {
         self
     }
 
+    /// Optionally set a cancellation token for the monitor loop (for advanced users).
+    pub fn with_cancel_token(mut self, cancel: CancellationToken) -> Self {
+        self.cancel = cancel;
+        self
+    }
+
     /// Build the client.
     pub fn build(self) -> Result<WeixinClient> {
         let handler = self
@@ -124,7 +132,7 @@ impl WeixinClientBuilder {
             session_guard: Arc::new(SessionGuard::new()),
             config_cache,
             context_tokens: Arc::new(ContextTokenStore::new()),
-            cancel: CancellationToken::new(),
+            cancel: self.cancel,
         })
     }
 }

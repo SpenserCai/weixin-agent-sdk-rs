@@ -9,9 +9,9 @@ pub const DEFAULT_BASE_URL: &str = "https://ilinkai.weixin.qq.com/";
 /// Default CDN base URL (no trailing slash).
 pub const DEFAULT_CDN_BASE_URL: &str = "https://novac2c.cdn.weixin.qq.com/c2c";
 /// Default long-poll timeout.
-pub const DEFAULT_LONG_POLL_TIMEOUT: Duration = Duration::from_millis(35_000);
+pub const DEFAULT_LONG_POLL_TIMEOUT: Duration = Duration::from_secs(35);
 /// Default API request timeout.
-pub const DEFAULT_API_TIMEOUT: Duration = Duration::from_millis(15_000);
+pub const DEFAULT_API_TIMEOUT: Duration = Duration::from_secs(15);
 
 /// SDK protocol configuration — no persistence paths.
 #[derive(Debug, Clone)]

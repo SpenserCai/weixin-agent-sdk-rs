@@ -13,8 +13,8 @@ keywords = ["weixin", "wechat", "bot", "ilink", "agent"]
 categories = ["api-bindings", "asynchronous"]
 
 [dependencies]
-tokio = { version = "1", features = ["full"] }
-reqwest = { version = "0.12", features = ["json"] }
+tokio = { version = "1", features = ["macros", "fs", "time", "rt"] }
+reqwest = { version = "0.13", features = ["rustls", "json", "gzip"] }
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 serde_repr = "0.1"
