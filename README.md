@@ -5,25 +5,27 @@
 [![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](LICENSE)
 [![Rust](https://img.shields.io/badge/rust-%3E%3D1.85.0-orange.svg)](https://www.rust-lang.org)
 
-微信 iLink AI Bot 协议的 Rust SDK 实现，基于 [`@tencent-weixin/openclaw-weixin`](https://www.npmjs.com/package/@tencent-weixin/openclaw-weixin) v2.1.1 协议层等价移植。
+微信 iLink AI Bot 协议的 Rust SDK 实现，基于 [`@tencent-weixin/openclaw-weixin`](https://www.npmjs.com/package/@tencent-weixin/openclaw-weixin) v2.4.3 协议层等价移植。
 
 本 SDK 是纯协议层实现，**不耦合 OpenClaw**，可用于自定义 Agent 接入微信 ClawBot 使用。
 
 ## 功能特性
 
-- iLink Bot API 全端点封装（getUpdates / sendMessage / getUploadUrl / getConfig / sendTyping）
+- iLink Bot API 全端点封装（getUpdates / sendMessage / getUploadUrl / getConfig / sendTyping / notifyStart / notifyStop）
 - 长轮询消息循环（自动退避重连、Session 过期处理、动态超时调整）
 - CDN 文件上传/下载（AES-128-ECB 加解密、自动重试）
 - 消息收发（文本、图片、视频、文件、语音，含引用消息解析）
-- QR 码登录 API 封装
+- 出站文本 Markdown 过滤（`StreamingMarkdownFilter`，默认开启，可配置关闭）
+- QR 码登录 API 封装（含配对码验证流程）
+- 连接生命周期通知（notifyStart / notifyStop）
 - 纯协议 SDK — 不管理状态持久化，由调用方自行决定存储策略
-- 统一 async/await（基于 tokio）
+- 统一 async/await（基于 tokio + rustls）
 
 ## 协议版本
 
 | 参考实现 | 版本 | 说明 |
 |---------|------|------|
-| [`@tencent-weixin/openclaw-weixin`](https://www.npmjs.com/package/@tencent-weixin/openclaw-weixin) | 2.1.1 | 协议层等价移植（不包含 OpenClaw 插件框架部分） |
+| [`@tencent-weixin/openclaw-weixin`](https://www.npmjs.com/package/@tencent-weixin/openclaw-weixin) | 2.4.3 | 协议层等价移植（不包含 OpenClaw 插件框架部分） |
 
 ## 快速开始
 
@@ -78,7 +80,9 @@ async fn main() -> Result<()> {
 | 长轮询 + 重连 | ✅ | |
 | CDN 上传/下载/加密 | ✅ | |
 | 消息解析/构建 | ✅ | |
+| 出站 Markdown 过滤 | ✅ | |
 | QR 码 API 调用 | ✅ | |
+| 连接生命周期通知 | ✅ | |
 | Context Token 内存管理 | ✅ | |
 | sync_buf 持久化 | | ✅ |
 | 账号凭证存储 | | ✅ |
@@ -88,6 +92,17 @@ async fn main() -> Result<()> {
 `sync_buf` 通过 `MessageHandler::on_sync_buf_updated()` 回调通知，调用方自行持久化。Context Token 提供 `export_all()` / `import()` 接口供调用方备份恢复。
 
 ## 核心 API
+
+### WeixinConfig
+
+```rust
+let config = WeixinConfig::builder()
+    .token("your-bot-token")
+    .bot_agent("my-app/1.0")       // 可选，默认 "weixin-agent-rs"
+    .markdown_filter(false)         // 可选，默认 true（开启出站 markdown 过滤）
+    .base_url("https://custom.example.com/")  // 可选
+    .build()?;
+```
 
 ### MessageHandler trait
 
@@ -129,14 +144,18 @@ use weixin_agent::{StandaloneQrLogin, WeixinConfig, LoginStatus};
 
 let config = WeixinConfig::builder().token("").build()?;
 let qr = StandaloneQrLogin::new(&config);
-let session = qr.start(None).await?;
+let session = qr.start(None, &[]).await?;
 println!("请扫描二维码: {}", session.qrcode_img_content);
 
 loop {
-    match qr.poll_status(&session).await? {
+    match qr.poll_status(&session, None).await? {
         LoginStatus::Confirmed { bot_token, base_url, .. } => {
             // 保存 token，用 token 创建 WeixinClient
             break;
+        }
+        LoginStatus::NeedVerifyCode => {
+            // 提示用户输入手机上显示的验证码
+            // 下次 poll_status 时传入 Some("1234")
         }
         LoginStatus::Expired => { /* 重新获取 QR 码 */ }
         _ => tokio::time::sleep(Duration::from_secs(2)).await,
@@ -148,19 +167,35 @@ loop {
 
 ```rust
 let qr = client.qr_login();
-let session = qr.start(None).await?;
-println!("请扫描二维码: {}", session.qrcode_img_content);
+let session = qr.start(None, &[]).await?;
+// ... 同上
+```
 
-loop {
-    match qr.poll_status(&session).await? {
-        LoginStatus::Confirmed { bot_token, base_url, .. } => {
-            // 保存 token，重新创建 client
-            break;
-        }
-        LoginStatus::Expired => { /* 重新获取 QR 码 */ }
-        _ => tokio::time::sleep(Duration::from_secs(2)).await,
-    }
-}
+### Markdown 过滤
+
+SDK 默认对出站文本应用 `StreamingMarkdownFilter`，过滤微信不支持的 Markdown 语法：
+
+```rust
+use weixin_agent::{StreamingMarkdownFilter, filter_markdown};
+
+// 一次性过滤
+let filtered = filter_markdown("**粗体** *中文斜体* ![img](url)");
+// → "**粗体** 中文斜体 "（保留粗体，去除 CJK 斜体标记，移除图片）
+
+// 流式过滤（适用于 LLM 流式输出）
+let mut f = StreamingMarkdownFilter::new();
+let out1 = f.feed("**hello** ");
+let out2 = f.feed("*world*");
+let out3 = f.flush();
+```
+
+通过 `.markdown_filter(false)` 关闭：
+
+```rust
+let config = WeixinConfig::builder()
+    .token("tok")
+    .markdown_filter(false)
+    .build()?;
 ```
 
 ### 主动发送消息
@@ -180,13 +215,15 @@ src/
 ├── error.rs            # 统一错误类型
 ├── types.rs            # 协议类型定义
 ├── api/                # iLink Bot HTTP API
-│   ├── client.rs       # HTTP 客户端
+│   ├── client.rs       # HTTP 客户端（含 notifyStart/notifyStop）
 │   ├── session_guard.rs # Session 暂停/冷却
 │   └── config_cache.rs # typing_ticket 缓存
 ├── monitor/            # 长轮询消息循环
 ├── messaging/          # 消息解析/构建/发送
+│   ├── markdown_filter.rs # 出站 Markdown 过滤器
+│   └── ...
 ├── cdn/                # CDN 上传/下载 + AES-ECB
-├── qr_login/           # QR 码登录 API
+├── qr_login/           # QR 码登录 API（含配对码验证）
 ├── media/              # MIME 类型检测
 └── util/               # 日志脱敏 / ID 生成
 ```
@@ -207,6 +244,7 @@ src/
 | 内置账号管理 | 不包含 | 应用层自行实现 |
 | 类/回调函数 | Trait + Builder | Rust 惯用模式 |
 | 自定义 JSON logger | tracing | Rust 生态标准 |
+| native-tls (OpenSSL) | rustls | 纯 Rust TLS，无系统依赖 |
 
 ## 环境要求
 

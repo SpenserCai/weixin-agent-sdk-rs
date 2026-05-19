@@ -10,7 +10,7 @@ use crate::api::client::HttpApiClient;
 use crate::cdn::aes_ecb;
 use crate::cdn::cdn_upload::{build_cdn_upload_url, upload_buffer_to_cdn};
 use crate::error::{Error, Result};
-use crate::types::{GetUploadUrlRequest, UploadMediaType, build_base_info};
+use crate::types::{GetUploadUrlRequest, UploadMediaType};
 use crate::util::random::random_hex;
 
 /// Result of a successful CDN upload.
@@ -80,7 +80,7 @@ pub(crate) async fn upload_file(
             thumb_rawfilemd5: None,
             thumb_filesize: None,
             aeskey: aes_key_hex.clone(),
-            base_info: build_base_info(),
+            base_info: api.base_info(),
         })
         .await?;
 

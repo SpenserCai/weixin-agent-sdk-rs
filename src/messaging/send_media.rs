@@ -10,8 +10,8 @@ use crate::media::mime::get_mime_from_filename;
 use crate::messaging::inbound::SendResult;
 use crate::messaging::send::generate_client_id;
 use crate::types::{
-    CdnMedia, FileItem, ImageItem, MessageItem, MessageItemType, MessageState, MessageType,
-    SendMessageRequest, UploadMediaType, VideoItem, WeixinMessage, build_base_info,
+    BaseInfo, CdnMedia, FileItem, ImageItem, MessageItem, MessageItemType, MessageState,
+    MessageType, SendMessageRequest, UploadMediaType, VideoItem, WeixinMessage,
 };
 
 /// Upload a file and send it as a message, routing by MIME type.
@@ -22,6 +22,7 @@ pub(crate) async fn send_media_file(
     file_path: &Path,
     text: &str,
     context_token: Option<&str>,
+    base_info: BaseInfo,
 ) -> Result<SendResult> {
     let filename = file_path
         .file_name()
@@ -43,7 +44,8 @@ pub(crate) async fn send_media_file(
 
     // Send text and media as separate requests
     if !text.is_empty() {
-        let text_req = crate::messaging::send::build_text_message(to, text, context_token);
+        let text_req =
+            crate::messaging::send::build_text_message(to, text, context_token, base_info.clone());
         api.send_message(&text_req).await?;
     }
 
@@ -59,7 +61,7 @@ pub(crate) async fn send_media_file(
             context_token: context_token.map(String::from),
             ..Default::default()
         },
-        base_info: build_base_info(),
+        base_info,
     };
     api.send_message(&req).await?;
 

@@ -9,7 +9,7 @@ use dashmap::DashMap;
 use crate::error::Result;
 use crate::types::{
     CdnMedia, MediaType, MessageItem, MessageItemType, MessageState, MessageType,
-    SendTypingRequest, TypingStatus, WeixinMessage, build_base_info,
+    SendTypingRequest, TypingStatus, WeixinMessage,
 };
 use crate::util::random::generate_id;
 
@@ -51,6 +51,7 @@ pub struct MessageSender {
     pub(crate) api: Arc<crate::api::client::HttpApiClient>,
     pub(crate) cdn_base_url: String,
     pub(crate) config_cache: Arc<crate::api::config_cache::ConfigCache>,
+    pub(crate) markdown_filter_enabled: bool,
 }
 
 /// Inbound message context passed to the handler.
@@ -87,6 +88,8 @@ impl MessageContext {
             &self.from,
             text,
             self.context_token.as_deref(),
+            self.sender.markdown_filter_enabled,
+            self.sender.api.base_info(),
         )
         .await
     }
@@ -100,6 +103,7 @@ impl MessageContext {
             file_path,
             "",
             self.context_token.as_deref(),
+            self.sender.api.base_info(),
         )
         .await
     }
@@ -139,7 +143,7 @@ impl MessageContext {
             ilink_user_id: self.from.clone(),
             typing_ticket: ticket,
             status: TypingStatus::Typing,
-            base_info: build_base_info(),
+            base_info: self.sender.api.base_info(),
         };
         self.sender.api.send_typing(&req).await
     }
@@ -155,7 +159,7 @@ impl MessageContext {
             ilink_user_id: self.from.clone(),
             typing_ticket: ticket,
             status: TypingStatus::Cancel,
-            base_info: build_base_info(),
+            base_info: self.sender.api.base_info(),
         };
         self.sender.api.send_typing(&req).await
     }

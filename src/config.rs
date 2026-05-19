@@ -28,6 +28,10 @@ pub struct WeixinConfig {
     pub long_poll_timeout: Duration,
     /// Timeout for regular API calls.
     pub api_timeout: Duration,
+    /// Bot agent string sent in all API requests (UA-style).
+    pub bot_agent: String,
+    /// Whether to apply markdown filter on outbound text. Default: `true`.
+    pub markdown_filter_enabled: bool,
 }
 
 /// Builder for [`WeixinConfig`].
@@ -40,6 +44,8 @@ pub struct WeixinConfigBuilder {
     route_tag: Option<u32>,
     long_poll_timeout: Option<Duration>,
     api_timeout: Option<Duration>,
+    bot_agent: Option<String>,
+    markdown_filter_enabled: Option<bool>,
 }
 
 impl WeixinConfig {
@@ -86,6 +92,18 @@ impl WeixinConfigBuilder {
         self
     }
 
+    /// Set the bot agent string (default: `"weixin-agent-rs"`).
+    pub fn bot_agent(mut self, agent: impl Into<String>) -> Self {
+        self.bot_agent = Some(agent.into());
+        self
+    }
+
+    /// Enable or disable the outbound markdown filter (default: `true`).
+    pub fn markdown_filter(mut self, enabled: bool) -> Self {
+        self.markdown_filter_enabled = Some(enabled);
+        self
+    }
+
     /// Build the config. Returns an error if `token` is missing.
     pub fn build(self) -> Result<WeixinConfig> {
         let token = self
@@ -100,6 +118,10 @@ impl WeixinConfigBuilder {
             route_tag: self.route_tag,
             long_poll_timeout: self.long_poll_timeout.unwrap_or(DEFAULT_LONG_POLL_TIMEOUT),
             api_timeout: self.api_timeout.unwrap_or(DEFAULT_API_TIMEOUT),
+            bot_agent: self
+                .bot_agent
+                .unwrap_or_else(|| "weixin-agent-rs".to_owned()),
+            markdown_filter_enabled: self.markdown_filter_enabled.unwrap_or(true),
         })
     }
 }
@@ -116,6 +138,8 @@ mod tests {
         assert_eq!(cfg.long_poll_timeout, DEFAULT_LONG_POLL_TIMEOUT);
         assert_eq!(cfg.api_timeout, DEFAULT_API_TIMEOUT);
         assert!(cfg.route_tag.is_none());
+        assert_eq!(cfg.bot_agent, "weixin-agent-rs");
+        assert!(cfg.markdown_filter_enabled);
     }
 
     #[test]
@@ -133,6 +157,8 @@ mod tests {
             .route_tag(42)
             .long_poll_timeout(Duration::from_secs(10))
             .api_timeout(Duration::from_secs(5))
+            .bot_agent("my-bot/1.0")
+            .markdown_filter(false)
             .build()
             .unwrap();
         assert_eq!(cfg.token, "my_token");
@@ -141,5 +167,7 @@ mod tests {
         assert_eq!(cfg.route_tag, Some(42));
         assert_eq!(cfg.long_poll_timeout, Duration::from_secs(10));
         assert_eq!(cfg.api_timeout, Duration::from_secs(5));
+        assert_eq!(cfg.bot_agent, "my-bot/1.0");
+        assert!(!cfg.markdown_filter_enabled);
     }
 }

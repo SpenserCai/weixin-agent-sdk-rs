@@ -12,7 +12,7 @@ use crate::error::Result;
 use crate::messaging::inbound::{self, ContextTokenStore, MessageSender};
 use crate::types::{
     BACKOFF_DELAY_MS, GetUpdatesRequest, MAX_CONSECUTIVE_FAILURES, RETRY_DELAY_MS,
-    SESSION_EXPIRED_ERRCODE, build_base_info,
+    SESSION_EXPIRED_ERRCODE,
 };
 
 /// The handler trait users implement to receive messages.
@@ -49,6 +49,7 @@ pub(crate) async fn run_monitor(
     initial_sync_buf: Option<String>,
     initial_timeout: Duration,
     cancel: CancellationToken,
+    markdown_filter_enabled: bool,
 ) -> Result<()> {
     handler.on_start().await?;
 
@@ -60,6 +61,7 @@ pub(crate) async fn run_monitor(
         api: Arc::clone(&api),
         cdn_base_url: cdn_base_url.clone(),
         config_cache: Arc::clone(&config_cache),
+        markdown_filter_enabled,
     });
 
     loop {
@@ -79,7 +81,7 @@ pub(crate) async fn run_monitor(
 
         let req = GetUpdatesRequest {
             get_updates_buf: get_updates_buf.clone(),
-            base_info: build_base_info(),
+            base_info: api.base_info(),
         };
 
         let resp = tokio::select! {
@@ -185,6 +187,10 @@ pub(crate) async fn run_monitor(
                 );
             }
         }
+    }
+
+    if let Err(e) = api.notify_stop().await {
+        tracing::warn!(error = %e, "notify_stop failed");
     }
 
     handler.on_shutdown().await?;

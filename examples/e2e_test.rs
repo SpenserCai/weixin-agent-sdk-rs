@@ -350,6 +350,10 @@ async fn main() -> anyhow::Result<()> {
             let tmp_dir = cli.state_dir.join(".login_tmp");
             tokio::fs::create_dir_all(&tmp_dir).await?;
 
+            // Load existing tokens from all user dirs for the QR login request
+            let existing_tokens = common::load_existing_tokens(&cli.state_dir).await;
+            tracing::info!(count = existing_tokens.len(), "loaded existing tokens");
+
             let (_token, bot_id) = common::qr_login(&tmp_dir, cli.base_url.as_deref()).await?;
 
             let dir_name = normalize_bot_id(&bot_id);

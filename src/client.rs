@@ -47,6 +47,10 @@ impl WeixinClient {
     ///
     /// `initial_sync_buf` should be loaded from your persistence layer (or `None` for fresh start).
     pub async fn start(&self, initial_sync_buf: Option<String>) -> Result<()> {
+        if let Err(e) = self.api.notify_start().await {
+            tracing::warn!(error = %e, "notify_start failed");
+        }
+
         crate::monitor::poll_loop::run_monitor(
             Arc::clone(&self.api),
             self.config.cdn_base_url.clone(),
@@ -57,6 +61,7 @@ impl WeixinClient {
             initial_sync_buf,
             self.config.long_poll_timeout,
             self.cancel.clone(),
+            self.config.markdown_filter_enabled,
         )
         .await
     }
@@ -73,7 +78,15 @@ impl WeixinClient {
         text: &str,
         context_token: Option<&str>,
     ) -> Result<SendResult> {
-        crate::messaging::send::send_text(&self.api, to, text, context_token).await
+        crate::messaging::send::send_text(
+            &self.api,
+            to,
+            text,
+            context_token,
+            self.config.markdown_filter_enabled,
+            self.api.base_info(),
+        )
+        .await
     }
 
     /// Send a media file to a user.
@@ -90,6 +103,7 @@ impl WeixinClient {
             file_path,
             "",
             context_token,
+            self.api.base_info(),
         )
         .await
     }

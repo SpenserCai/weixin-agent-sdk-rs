@@ -73,12 +73,14 @@ pub async fn qr_login(
     let config = builder.build()?;
     let qr = StandaloneQrLogin::new(&config);
 
-    let mut session = qr.start(None).await?;
+    let local_tokens = load_existing_tokens(state_dir).await;
+    let mut session = qr.start(None, &local_tokens).await?;
     print_qr(&session.qrcode_img_content);
 
     let mut refresh_count = 0u32;
+    let mut verify_code: Option<String> = None;
     loop {
-        match qr.poll_status(&session).await? {
+        match qr.poll_status(&session, verify_code.as_deref()).await? {
             LoginStatus::Confirmed {
                 bot_token,
                 ilink_bot_id,
@@ -91,6 +93,7 @@ pub async fn qr_login(
             }
             LoginStatus::Scanned => {
                 tracing::info!("scanned, waiting for confirmation...");
+                verify_code = None;
             }
             LoginStatus::Expired => {
                 refresh_count += 1;
@@ -98,10 +101,35 @@ pub async fn qr_login(
                     anyhow::bail!("QR code expired 3 times, giving up");
                 }
                 tracing::warn!("QR expired, refreshing ({refresh_count}/3)...");
-                session = qr.start(None).await?;
+                session = qr.start(None, &local_tokens).await?;
                 print_qr(&session.qrcode_img_content);
+                verify_code = None;
             }
-            LoginStatus::Wait | LoginStatus::ScannedButRedirect { .. } => {}
+            LoginStatus::NeedVerifyCode => {
+                println!("请输入验证码:");
+                let mut code = String::new();
+                std::io::stdin().read_line(&mut code)?;
+                verify_code = Some(code.trim().to_owned());
+            }
+            LoginStatus::VerifyCodeBlocked => {
+                refresh_count += 1;
+                if refresh_count >= 3 {
+                    anyhow::bail!("verify code blocked 3 times, giving up");
+                }
+                tracing::warn!("verify code blocked, refreshing QR ({refresh_count}/3)...");
+                session = qr.start(None, &local_tokens).await?;
+                print_qr(&session.qrcode_img_content);
+                verify_code = None;
+            }
+            LoginStatus::BindedRedirect => {
+                anyhow::bail!("account already bound to another bot, cannot login");
+            }
+            LoginStatus::Wait | LoginStatus::ScannedButRedirect { .. } => {
+                verify_code = None;
+            }
+            _ => {
+                verify_code = None;
+            }
         }
         tokio::time::sleep(Duration::from_secs(2)).await;
     }
@@ -114,6 +142,27 @@ fn print_qr(content: &str) {
         println!("请手动访问: {content}");
     }
     println!();
+}
+
+/// Load existing bot tokens from all user directories under `state_dir`.
+pub async fn load_existing_tokens(state_dir: &Path) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let Ok(mut entries) = tokio::fs::read_dir(state_dir).await else {
+        return tokens;
+    };
+    while let Ok(Some(entry)) = entries.next_entry().await {
+        let path = entry.path();
+        if path.is_dir() {
+            let token_file = path.join("token.txt");
+            if let Ok(t) = tokio::fs::read_to_string(&token_file).await {
+                let t = t.trim().to_owned();
+                if !t.is_empty() {
+                    tokens.push(t);
+                }
+            }
+        }
+    }
+    tokens
 }
 
 // ── State persistence helpers ───────────────────────────────────────

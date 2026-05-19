@@ -1,12 +1,12 @@
 //! QR code login API — only HTTP calls, no credential persistence.
 
+use std::fmt::Write as _;
 use std::time::Duration;
 
 use crate::api::client::HttpApiClient;
 use crate::error::Result;
 use crate::types::{
-    DEFAULT_ILINK_BOT_TYPE, DEFAULT_QR_GET_TIMEOUT_MS, DEFAULT_QR_POLL_TIMEOUT_MS, QrCodeResponse,
-    QrStatusResponse,
+    DEFAULT_ILINK_BOT_TYPE, DEFAULT_QR_POLL_TIMEOUT_MS, QrCodeResponse, QrStatusResponse,
 };
 
 /// QR login session returned by [`QrLoginApi::start`].
@@ -20,6 +20,7 @@ pub struct QrLoginSession {
 
 /// Login status returned by [`QrLoginApi::poll_status`].
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub enum LoginStatus {
     /// Waiting for scan.
     Wait,
@@ -43,6 +44,12 @@ pub enum LoginStatus {
     },
     /// QR code expired.
     Expired,
+    /// Server requires a verification code (pair-code displayed on phone).
+    NeedVerifyCode,
+    /// Too many wrong verification codes; QR code must be refreshed.
+    VerifyCodeBlocked,
+    /// Bot is already bound to this instance; no new credentials issued.
+    BindedRedirect,
 }
 
 /// QR login API wrapper.
@@ -56,17 +63,21 @@ impl<'a> QrLoginApi<'a> {
         Self { api }
     }
 
-    /// Fetch a new QR code. `bot_type` defaults to `"3"`.
-    pub async fn start(&self, bot_type: Option<&str>) -> Result<QrLoginSession> {
+    /// Fetch a new QR code via POST. `bot_type` defaults to `"3"`.
+    /// `local_tokens` sends up to 10 existing bot tokens to the server.
+    pub async fn start(
+        &self,
+        bot_type: Option<&str>,
+        local_tokens: &[String],
+    ) -> Result<QrLoginSession> {
         let bt = bot_type.unwrap_or(DEFAULT_ILINK_BOT_TYPE);
         let endpoint = format!(
             "ilink/bot/get_bot_qrcode?bot_type={}",
             urlencoding::encode(bt)
         );
-        let raw = self
-            .api
-            .api_get(&endpoint, Duration::from_millis(DEFAULT_QR_GET_TIMEOUT_MS))
-            .await?;
+        let tokens: Vec<&str> = local_tokens.iter().take(10).map(String::as_str).collect();
+        let body = serde_json::json!({ "local_token_list": tokens });
+        let raw = self.api.api_post(&endpoint, &body, None).await?;
         let resp: QrCodeResponse = serde_json::from_str(&raw)?;
         Ok(QrLoginSession {
             qrcode: resp.qrcode,
@@ -75,11 +86,19 @@ impl<'a> QrLoginApi<'a> {
     }
 
     /// Poll the login status for a QR session.
-    pub async fn poll_status(&self, session: &QrLoginSession) -> Result<LoginStatus> {
-        let endpoint = format!(
+    /// Pass `verify_code` when the server returned [`LoginStatus::NeedVerifyCode`].
+    pub async fn poll_status(
+        &self,
+        session: &QrLoginSession,
+        verify_code: Option<&str>,
+    ) -> Result<LoginStatus> {
+        let mut endpoint = format!(
             "ilink/bot/get_qrcode_status?qrcode={}",
             urlencoding::encode(&session.qrcode)
         );
+        if let Some(code) = verify_code {
+            let _ = write!(endpoint, "&verify_code={}", urlencoding::encode(code));
+        }
         let raw = match self
             .api
             .api_get(&endpoint, Duration::from_millis(DEFAULT_QR_POLL_TIMEOUT_MS))
@@ -105,6 +124,9 @@ impl<'a> QrLoginApi<'a> {
                 ilink_user_id: resp.ilink_user_id.unwrap_or_default(),
             },
             "expired" => LoginStatus::Expired,
+            "need_verifycode" => LoginStatus::NeedVerifyCode,
+            "verify_code_blocked" => LoginStatus::VerifyCodeBlocked,
+            "binded_redirect" => LoginStatus::BindedRedirect,
             _ => LoginStatus::Wait,
         })
     }
@@ -125,12 +147,65 @@ impl StandaloneQrLogin {
     }
 
     /// Fetch a new QR code.
-    pub async fn start(&self, bot_type: Option<&str>) -> Result<QrLoginSession> {
-        QrLoginApi::new(&self.api).start(bot_type).await
+    pub async fn start(
+        &self,
+        bot_type: Option<&str>,
+        local_tokens: &[String],
+    ) -> Result<QrLoginSession> {
+        QrLoginApi::new(&self.api)
+            .start(bot_type, local_tokens)
+            .await
     }
 
     /// Poll the login status.
-    pub async fn poll_status(&self, session: &QrLoginSession) -> Result<LoginStatus> {
-        QrLoginApi::new(&self.api).poll_status(session).await
+    pub async fn poll_status(
+        &self,
+        session: &QrLoginSession,
+        verify_code: Option<&str>,
+    ) -> Result<LoginStatus> {
+        QrLoginApi::new(&self.api)
+            .poll_status(session, verify_code)
+            .await
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parse_need_verify_code_status() {
+        let json = r#"{"status":"need_verifycode"}"#;
+        let resp: QrStatusResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.status, "need_verifycode");
+    }
+
+    #[test]
+    fn parse_verify_code_blocked_status() {
+        let json = r#"{"status":"verify_code_blocked"}"#;
+        let resp: QrStatusResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.status, "verify_code_blocked");
+    }
+
+    #[test]
+    fn parse_binded_redirect_status() {
+        let json = r#"{"status":"binded_redirect"}"#;
+        let resp: QrStatusResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(resp.status, "binded_redirect");
+    }
+
+    #[test]
+    fn verify_code_appended_to_endpoint() {
+        let qrcode = "test_qr";
+        let mut endpoint = format!(
+            "ilink/bot/get_qrcode_status?qrcode={}",
+            urlencoding::encode(qrcode)
+        );
+        let verify_code = Some("1234");
+        if let Some(code) = verify_code {
+            let _ = write!(endpoint, "&verify_code={}", urlencoding::encode(code));
+        }
+        assert!(endpoint.contains("verify_code=1234"));
+        assert!(endpoint.contains("qrcode=test_qr"));
     }
 }

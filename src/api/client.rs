@@ -5,9 +5,9 @@ use std::time::Duration;
 use crate::config::WeixinConfig;
 use crate::error::{Error, Result};
 use crate::types::{
-    CHANNEL_VERSION, DEFAULT_CONFIG_TIMEOUT_MS, GetConfigRequest, GetConfigResponse,
+    BaseInfo, CHANNEL_VERSION, DEFAULT_CONFIG_TIMEOUT_MS, GetConfigRequest, GetConfigResponse,
     GetUpdatesRequest, GetUpdatesResponse, GetUploadUrlRequest, GetUploadUrlResponse, ILINK_APP_ID,
-    SendMessageRequest, SendTypingRequest, build_base_info,
+    SendMessageRequest, SendTypingRequest, build_base_info_with_agent,
 };
 use crate::util::redact;
 
@@ -42,6 +42,7 @@ pub(crate) struct HttpApiClient {
     token: String,
     route_tag: Option<u32>,
     api_timeout: Duration,
+    bot_agent: String,
     http: reqwest::Client,
 }
 
@@ -53,6 +54,7 @@ impl HttpApiClient {
             token: config.token.clone(),
             route_tag: config.route_tag,
             api_timeout: config.api_timeout,
+            bot_agent: config.bot_agent.clone(),
             http: reqwest::Client::new(),
         }
     }
@@ -88,7 +90,7 @@ impl HttpApiClient {
         &self,
         endpoint: &str,
         body: &impl serde::Serialize,
-        timeout: Duration,
+        timeout: Option<Duration>,
     ) -> Result<T> {
         let url = format!("{}{endpoint}", self.base_url);
         let body_str = serde_json::to_string(body)?;
@@ -98,7 +100,10 @@ impl HttpApiClient {
             "POST"
         );
 
-        let mut builder = self.http.post(&url).timeout(timeout).body(body_str);
+        let mut builder = self.http.post(&url).body(body_str);
+        if let Some(t) = timeout {
+            builder = builder.timeout(t);
+        }
         for (k, v) in self.post_headers() {
             builder = builder.header(k, v);
         }
@@ -155,7 +160,7 @@ impl HttpApiClient {
     /// Send a message.
     pub async fn send_message(&self, request: &SendMessageRequest) -> Result<()> {
         let _: serde_json::Value = self
-            .post_json("ilink/bot/sendmessage", request, self.api_timeout)
+            .post_json("ilink/bot/sendmessage", request, Some(self.api_timeout))
             .await?;
         Ok(())
     }
@@ -165,7 +170,7 @@ impl HttpApiClient {
         &self,
         request: &GetUploadUrlRequest,
     ) -> Result<GetUploadUrlResponse> {
-        self.post_json("ilink/bot/getuploadurl", request, self.api_timeout)
+        self.post_json("ilink/bot/getuploadurl", request, Some(self.api_timeout))
             .await
     }
 
@@ -178,12 +183,12 @@ impl HttpApiClient {
         let body = GetConfigRequest {
             ilink_user_id: user_id.to_owned(),
             context_token: context_token.map(String::from),
-            base_info: build_base_info(),
+            base_info: self.base_info(),
         };
         self.post_json(
             "ilink/bot/getconfig",
             &body,
-            Duration::from_millis(DEFAULT_CONFIG_TIMEOUT_MS),
+            Some(Duration::from_millis(DEFAULT_CONFIG_TIMEOUT_MS)),
         )
         .await
     }
@@ -194,7 +199,77 @@ impl HttpApiClient {
             .post_json(
                 "ilink/bot/sendtyping",
                 request,
-                Duration::from_millis(DEFAULT_CONFIG_TIMEOUT_MS),
+                Some(Duration::from_millis(DEFAULT_CONFIG_TIMEOUT_MS)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Build a `BaseInfo` with the configured `bot_agent`.
+    pub fn base_info(&self) -> BaseInfo {
+        build_base_info_with_agent(&self.bot_agent)
+    }
+
+    /// POST request without auth token (for QR login endpoint).
+    pub async fn api_post(
+        &self,
+        endpoint: &str,
+        body: &impl serde::Serialize,
+        timeout: Option<Duration>,
+    ) -> Result<String> {
+        let url = format!("{}{endpoint}", self.base_url);
+        let body_str = serde_json::to_string(body)?;
+        tracing::debug!(
+            url = redact::redact_url(&url),
+            body = redact::redact_body_default(&body_str),
+            "POST (no-auth)"
+        );
+
+        let mut builder = self.http.post(&url).body(body_str);
+        if let Some(t) = timeout {
+            builder = builder.timeout(t);
+        }
+        builder = builder
+            .header("Content-Type", "application/json")
+            .header("AuthorizationType", "ilink_bot_token")
+            .header("X-WECHAT-UIN", random_wechat_uin());
+        for (k, v) in self.common_headers() {
+            builder = builder.header(k, v);
+        }
+
+        let response = builder.send().await?;
+        let status = response.status();
+        let raw = response.text().await?;
+        if !status.is_success() {
+            return Err(Error::Api {
+                errcode: i32::from(status.as_u16()),
+                errmsg: raw,
+            });
+        }
+        Ok(raw)
+    }
+
+    /// Notify server that this bot is starting (best-effort).
+    pub async fn notify_start(&self) -> Result<()> {
+        let body = serde_json::json!({ "base_info": self.base_info() });
+        let _: serde_json::Value = self
+            .post_json(
+                "ilink/bot/msg/notifystart",
+                &body,
+                Some(Duration::from_secs(10)),
+            )
+            .await?;
+        Ok(())
+    }
+
+    /// Notify server that this bot is stopping (best-effort).
+    pub async fn notify_stop(&self) -> Result<()> {
+        let body = serde_json::json!({ "base_info": self.base_info() });
+        let _: serde_json::Value = self
+            .post_json(
+                "ilink/bot/msg/notifystop",
+                &body,
+                Some(Duration::from_secs(10)),
             )
             .await?;
         Ok(())

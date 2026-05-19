@@ -8,7 +8,7 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 /// iLink-App-Id header value.
 pub const ILINK_APP_ID: &str = "bot";
 /// Channel version sent in `base_info`.
-pub const CHANNEL_VERSION: &str = "2.1.1";
+pub const CHANNEL_VERSION: &str = "2.4.3";
 /// Fixed QR code base URL.
 pub const QR_CODE_BASE_URL: &str = "https://ilinkai.weixin.qq.com/";
 /// Default bot type for QR login.
@@ -40,8 +40,6 @@ pub const UPLOAD_MAX_RETRIES: u32 = 3;
 pub const CONFIG_CACHE_TTL_MS: u64 = 86_400_000;
 /// Max QR refresh count.
 pub const MAX_QR_REFRESH_COUNT: u32 = 3;
-/// QR get timeout.
-pub const DEFAULT_QR_GET_TIMEOUT_MS: u64 = 5_000;
 /// QR poll timeout.
 pub const DEFAULT_QR_POLL_TIMEOUT_MS: u64 = 35_000;
 
@@ -137,13 +135,22 @@ pub struct BaseInfo {
     /// Channel version string.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub channel_version: Option<String>,
+    /// Bot agent UA string.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub bot_agent: Option<String>,
 }
 
-/// Build a `BaseInfo` with the current channel version.
-pub fn build_base_info() -> BaseInfo {
+/// Build a `BaseInfo` with the current channel version and bot agent.
+pub fn build_base_info_with_agent(bot_agent: &str) -> BaseInfo {
     BaseInfo {
         channel_version: Some(CHANNEL_VERSION.to_owned()),
+        bot_agent: Some(bot_agent.to_owned()),
     }
+}
+
+/// Build a `BaseInfo` with the current channel version (legacy, prefer `build_base_info_with_agent`).
+pub fn build_base_info() -> BaseInfo {
+    build_base_info_with_agent("weixin-agent-rs")
 }
 
 // ── CDN / Media sub-structures ──────────────────────────────────────
@@ -517,7 +524,7 @@ pub struct QrCodeResponse {
 }
 
 /// QR status response from server.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct QrStatusResponse {
     /// Current status.
     pub status: String,

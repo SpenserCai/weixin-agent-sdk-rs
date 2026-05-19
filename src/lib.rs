@@ -48,6 +48,7 @@ pub use error::{Error, Result};
 pub use messaging::inbound::{
     ContextTokenStore, MediaInfo, MessageContext, RefMessageInfo, SendResult,
 };
+pub use messaging::markdown_filter::{StreamingMarkdownFilter, filter_markdown};
 pub use monitor::poll_loop::MessageHandler;
 pub use qr_login::login::{LoginStatus, QrLoginApi, QrLoginSession, StandaloneQrLogin};
 pub use types::{
