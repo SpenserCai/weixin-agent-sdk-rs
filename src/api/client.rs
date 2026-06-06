@@ -7,7 +7,7 @@ use crate::error::{Error, Result};
 use crate::types::{
     BaseInfo, CHANNEL_VERSION, DEFAULT_CONFIG_TIMEOUT_MS, GetConfigRequest, GetConfigResponse,
     GetUpdatesRequest, GetUpdatesResponse, GetUploadUrlRequest, GetUploadUrlResponse, ILINK_APP_ID,
-    SendMessageRequest, SendTypingRequest, build_base_info_with_agent,
+    SESSION_EXPIRED_ERRCODE, SendMessageRequest, SendTypingRequest, build_base_info_with_agent,
 };
 use crate::util::redact;
 
@@ -33,6 +33,46 @@ fn ensure_trailing_slash(url: &str) -> String {
         url.to_owned()
     } else {
         format!("{url}/")
+    }
+}
+
+fn api_error_from_json(value: &serde_json::Value) -> Option<Error> {
+    let ret = value.get("ret").and_then(serde_json::Value::as_i64);
+    let errcode = value.get("errcode").and_then(serde_json::Value::as_i64);
+    let code = errcode.filter(|code| *code != 0).or(ret)?;
+
+    if code == 0 {
+        return None;
+    }
+
+    if code == i64::from(SESSION_EXPIRED_ERRCODE) {
+        return Some(Error::SessionExpired);
+    }
+
+    let errmsg = value
+        .get("errmsg")
+        .or_else(|| value.get("message"))
+        .or_else(|| value.get("msg"))
+        .and_then(serde_json::Value::as_str)
+        .map_or_else(|| value.to_string(), ToOwned::to_owned);
+
+    Some(Error::Api {
+        errcode: i32::try_from(code).unwrap_or_else(|_| {
+            if code.is_negative() {
+                i32::MIN
+            } else {
+                i32::MAX
+            }
+        }),
+        errmsg,
+    })
+}
+
+fn ensure_api_success(value: &serde_json::Value) -> Result<()> {
+    if let Some(error) = api_error_from_json(value) {
+        Err(error)
+    } else {
+        Ok(())
     }
 }
 
@@ -159,9 +199,10 @@ impl HttpApiClient {
 
     /// Send a message.
     pub async fn send_message(&self, request: &SendMessageRequest) -> Result<()> {
-        let _: serde_json::Value = self
+        let value: serde_json::Value = self
             .post_json("ilink/bot/sendmessage", request, Some(self.api_timeout))
             .await?;
+        ensure_api_success(&value)?;
         Ok(())
     }
 
@@ -195,13 +236,14 @@ impl HttpApiClient {
 
     /// Send a typing indicator.
     pub async fn send_typing(&self, request: &SendTypingRequest) -> Result<()> {
-        let _: serde_json::Value = self
+        let value: serde_json::Value = self
             .post_json(
                 "ilink/bot/sendtyping",
                 request,
                 Some(Duration::from_millis(DEFAULT_CONFIG_TIMEOUT_MS)),
             )
             .await?;
+        ensure_api_success(&value)?;
         Ok(())
     }
 
@@ -252,26 +294,28 @@ impl HttpApiClient {
     /// Notify server that this bot is starting (best-effort).
     pub async fn notify_start(&self) -> Result<()> {
         let body = serde_json::json!({ "base_info": self.base_info() });
-        let _: serde_json::Value = self
+        let value: serde_json::Value = self
             .post_json(
                 "ilink/bot/msg/notifystart",
                 &body,
                 Some(Duration::from_secs(10)),
             )
             .await?;
+        ensure_api_success(&value)?;
         Ok(())
     }
 
     /// Notify server that this bot is stopping (best-effort).
     pub async fn notify_stop(&self) -> Result<()> {
         let body = serde_json::json!({ "base_info": self.base_info() });
-        let _: serde_json::Value = self
+        let value: serde_json::Value = self
             .post_json(
                 "ilink/bot/msg/notifystop",
                 &body,
                 Some(Duration::from_secs(10)),
             )
             .await?;
+        ensure_api_success(&value)?;
         Ok(())
     }
 
@@ -301,6 +345,7 @@ impl HttpApiClient {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error::Error;
 
     #[test]
     fn build_client_version_encoding() {
@@ -335,5 +380,36 @@ mod tests {
             .unwrap();
         let s = std::str::from_utf8(&decoded).unwrap();
         assert!(s.parse::<u32>().is_ok());
+    }
+
+    #[test]
+    fn api_status_accepts_success_body() {
+        let value = serde_json::json!({ "ret": 0, "errmsg": "" });
+
+        ensure_api_success(&value).unwrap();
+    }
+
+    #[test]
+    fn api_status_rejects_nonzero_body() {
+        let value = serde_json::json!({ "ret": 123, "errmsg": "bad request" });
+        let err = ensure_api_success(&value).unwrap_err();
+
+        assert!(matches!(
+            err,
+            Error::Api {
+                errcode: 123,
+                errmsg
+            } if errmsg == "bad request"
+        ));
+    }
+
+    #[test]
+    fn api_status_maps_session_expired_body() {
+        let value = serde_json::json!({ "errcode": SESSION_EXPIRED_ERRCODE });
+
+        assert!(matches!(
+            ensure_api_success(&value).unwrap_err(),
+            Error::SessionExpired
+        ));
     }
 }
