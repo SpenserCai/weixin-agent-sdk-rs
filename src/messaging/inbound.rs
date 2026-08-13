@@ -7,11 +7,16 @@ use std::sync::Arc;
 use dashmap::DashMap;
 
 use crate::error::Result;
+use crate::messaging::outbound_run::OutboundRun;
 use crate::types::{
     CdnMedia, MediaType, MessageItem, MessageItemType, MessageState, MessageType,
     SendTypingRequest, TypingStatus, WeixinMessage,
 };
 use crate::util::random::generate_id;
+
+/// Compatibility re-export — `MessageSender` moved to `messaging::sender`,
+/// where the outbound assembly path now lives.
+pub use crate::messaging::sender::MessageSender;
 
 /// High-level media information extracted from an inbound message.
 #[derive(Debug, Clone)]
@@ -31,12 +36,23 @@ pub struct MediaInfo {
 }
 
 /// Quoted (referenced) message info.
+///
+/// The server does not always echo the quoted message's content: `title` and
+/// `body` were both observed empty for a quoted text message, while
+/// `referenced_msg_id` was populated with that message's platform ID. Treat
+/// `referenced_msg_id` as the reliable way to correlate a quote with a message
+/// you saw earlier, and the other two fields as best-effort.
 #[derive(Debug, Clone)]
+#[non_exhaustive]
 pub struct RefMessageInfo {
-    /// Summary title.
+    /// Summary title. May be `None` even when a quote is present.
     pub title: Option<String>,
-    /// Body text of the quoted message.
+    /// Body text of the quoted message. May be empty even when a quote is present.
     pub body: Option<String>,
+    /// Item-level ID of the quoted message, when the server provides it.
+    ///
+    /// Matches the `message_id` the platform assigned to that message.
+    pub referenced_msg_id: Option<String>,
 }
 
 /// Result of sending a message.
@@ -46,17 +62,12 @@ pub struct SendResult {
     pub message_id: String,
 }
 
-/// Internal sender handle for replying from a [`MessageContext`].
-pub struct MessageSender {
-    pub(crate) api: Arc<crate::api::client::HttpApiClient>,
-    pub(crate) cdn_base_url: String,
-    pub(crate) config_cache: Arc<crate::api::config_cache::ConfigCache>,
-    pub(crate) markdown_filter_enabled: bool,
-}
-
 /// Inbound message context passed to the handler.
 pub struct MessageContext {
-    /// SDK-generated message session ID.
+    /// SDK-local identifier for this delivery, regenerated on every parse.
+    ///
+    /// Not a platform ID and not stable across restarts — use
+    /// [`MessageContext::server_message_id`] for platform-side identity.
     pub message_id: String,
     /// Server-assigned message ID.
     pub server_message_id: Option<i64>,
@@ -83,29 +94,24 @@ pub struct MessageContext {
 impl MessageContext {
     /// Reply with a text message.
     pub async fn reply_text(&self, text: &str) -> Result<SendResult> {
-        crate::messaging::send::send_text(
-            &self.sender.api,
-            &self.from,
-            text,
-            self.context_token.as_deref(),
-            self.sender.markdown_filter_enabled,
-            self.sender.api.base_info(),
-        )
-        .await
+        self.sender
+            .send_text(&self.from, text, self.context_token.as_deref(), None)
+            .await
     }
 
     /// Reply with a media file.
     pub async fn reply_media(&self, file_path: &Path) -> Result<SendResult> {
-        crate::messaging::send_media::send_media_file(
-            &self.sender.api,
-            &self.sender.cdn_base_url,
-            &self.from,
-            file_path,
-            "",
-            self.context_token.as_deref(),
-            self.sender.api.base_info(),
-        )
-        .await
+        self.sender
+            .send_media(&self.from, file_path, self.context_token.as_deref(), None)
+            .await
+    }
+
+    /// Start an outbound run addressed to this message's sender.
+    ///
+    /// Inherits `from` as the target and this message's `context_token`. Every
+    /// message sent through the returned handle carries the same `run_id`.
+    pub fn run(&self) -> OutboundRun {
+        self.sender.run(&self.from, self.context_token.as_deref())
     }
 
     /// Download media from this message to a destination path.
@@ -357,6 +363,10 @@ fn extract_ref_message(items: &[MessageItem]) -> Option<RefMessageInfo> {
                     .message_item
                     .as_ref()
                     .map(|ri| body_from_item_list(&[*ri.clone()])),
+                referenced_msg_id: ref_msg
+                    .message_item
+                    .as_ref()
+                    .and_then(|ri| ri.msg_id.clone()),
             });
         }
     }
@@ -572,5 +582,72 @@ mod tests {
         store2.import(exported);
         assert_eq!(store2.get("u1"), Some("t1".into()));
         assert_eq!(store2.get("u2"), Some("t2".into()));
+    }
+
+    #[test]
+    fn ref_message_exposes_referenced_msg_id() {
+        let items = vec![MessageItem {
+            item_type: Some(MessageItemType::Text),
+            text_item: Some(TextItem {
+                text: Some("reply".into()),
+            }),
+            ref_msg: Some(RefMessage {
+                title: Some("quoted title".into()),
+                message_item: Some(Box::new(MessageItem {
+                    item_type: Some(MessageItemType::Text),
+                    msg_id: Some("srv-msg-42".into()),
+                    text_item: Some(TextItem {
+                        text: Some("original".into()),
+                    }),
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        }];
+        let info = extract_ref_message(&items).unwrap();
+        assert_eq!(info.referenced_msg_id.as_deref(), Some("srv-msg-42"));
+        assert_eq!(info.title.as_deref(), Some("quoted title"));
+        assert_eq!(info.body.as_deref(), Some("original"));
+    }
+
+    #[test]
+    fn ref_message_without_msg_id_is_none() {
+        let items = vec![MessageItem {
+            item_type: Some(MessageItemType::Text),
+            text_item: Some(TextItem {
+                text: Some("reply".into()),
+            }),
+            ref_msg: Some(RefMessage {
+                title: Some("t".into()),
+                message_item: Some(Box::new(MessageItem {
+                    item_type: Some(MessageItemType::Text),
+                    text_item: Some(TextItem {
+                        text: Some("original".into()),
+                    }),
+                    ..Default::default()
+                })),
+            }),
+            ..Default::default()
+        }];
+        let info = extract_ref_message(&items).unwrap();
+        assert!(info.referenced_msg_id.is_none());
+        // Other fields must still be populated.
+        assert_eq!(info.title.as_deref(), Some("t"));
+        assert_eq!(info.body.as_deref(), Some("original"));
+    }
+
+    #[test]
+    fn unknown_item_type_yields_no_media() {
+        let items = vec![MessageItem {
+            item_type: Some(MessageItemType::Unknown(99)),
+            ..Default::default()
+        }];
+        assert!(extract_media(&items).is_none());
+        // Tool-call progress items are not media either.
+        let progress = vec![MessageItem {
+            item_type: Some(MessageItemType::ToolCallStart),
+            ..Default::default()
+        }];
+        assert!(extract_media(&progress).is_none());
     }
 }

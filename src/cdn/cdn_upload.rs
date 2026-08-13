@@ -3,7 +3,7 @@
 use crate::cdn::aes_ecb;
 use crate::error::{Error, Result};
 use crate::types::UPLOAD_MAX_RETRIES;
-use crate::util::redact;
+use crate::util::{net_error, redact};
 
 /// Build a CDN upload URL from `upload_param` and `filekey`.
 pub fn build_cdn_upload_url(cdn_base_url: &str, upload_param: &str, filekey: &str) -> String {
@@ -70,8 +70,23 @@ pub async fn upload_buffer_to_cdn(
                 last_error = Some(Error::CdnUpload("missing x-encrypted-param header".into()));
             }
             Err(e) => {
-                tracing::error!(attempt, error = %e, "CDN upload network error");
-                last_error = Some(Error::CdnUpload(e.to_string()));
+                // The reqwest error and its source chain can carry the full CDN URL
+                // (including `encrypted_query_param` / `filekey`), so neither the
+                // error text nor a string built from it may be logged or stored
+                // (standards §1.3). Only the classification is kept.
+                let err = Error::Http(e);
+                let kind = net_error::classify(&err);
+                tracing::error!(
+                    attempt,
+                    url = redact::redact_url(cdn_url),
+                    kind = kind.as_str(),
+                    description = kind.description(),
+                    "CDN upload transport failure"
+                );
+                last_error = Some(Error::CdnUpload(format!(
+                    "CDN upload transport failure ({})",
+                    kind.as_str()
+                )));
             }
         }
     }

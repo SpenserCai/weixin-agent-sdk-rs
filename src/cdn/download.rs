@@ -4,6 +4,7 @@ use crate::cdn::aes_ecb;
 use crate::cdn::cdn_upload::build_cdn_download_url;
 use crate::error::{Error, Result};
 use crate::types::CdnMedia;
+use crate::util::net_error;
 
 /// Resolve the download URL for a CDN media reference.
 /// Prefers `full_url`, falls back to constructing from `encrypt_query_param`.
@@ -22,14 +23,40 @@ pub fn resolve_cdn_download_url(cdn_base_url: &str, media: &CdnMedia) -> Option<
 }
 
 /// Download raw bytes from a URL.
+///
+/// Transport failures are logged with a redacted URL and a failure category; the
+/// raw error text is never logged, since it can carry the full CDN URL including
+/// its query string (standards §1.3).
 async fn fetch_bytes(url: &str) -> Result<Vec<u8>> {
-    let res = reqwest::get(url).await?;
+    let res = reqwest::get(url).await.map_err(|e| {
+        log_download_failure(url, "request", &Error::Http(e));
+        Error::CdnUpload("CDN download transport failure".into())
+    })?;
     if !res.status().is_success() {
         let status = res.status();
         let body = res.text().await.unwrap_or_default();
         return Err(Error::CdnUpload(format!("CDN download {status}: {body}")));
     }
-    Ok(res.bytes().await?.to_vec())
+    match res.bytes().await {
+        Ok(bytes) => Ok(bytes.to_vec()),
+        Err(e) => {
+            log_download_failure(url, "body", &Error::Http(e));
+            Err(Error::CdnUpload(
+                "CDN download body transfer failure".into(),
+            ))
+        }
+    }
+}
+
+fn log_download_failure(url: &str, stage: &str, err: &Error) {
+    let kind = net_error::classify(err);
+    tracing::error!(
+        stage,
+        url = crate::util::redact::redact_url(url),
+        kind = kind.as_str(),
+        description = kind.description(),
+        "CDN download transport failure"
+    );
 }
 
 /// Download and AES-128-ECB decrypt a CDN media file.

@@ -1,11 +1,13 @@
-//! In-memory session pause/cooldown guard.
+//! In-memory poll-loop pause/cooldown guard.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use crate::error::{Error, Result};
 use crate::types::SESSION_PAUSE_DURATION_MS;
 
-/// Guards against API calls during a session-expired cooldown period.
+/// Guards the long-poll loop during a stale-token cooldown period.
+///
+/// Only the poll loop consults this guard; outbound calls are not blocked.
 pub(crate) struct SessionGuard {
     pause_until_ms: AtomicU64,
 }
@@ -18,11 +20,11 @@ impl SessionGuard {
         }
     }
 
-    /// Pause all API calls for one hour from now.
+    /// Pause the poll loop for one hour from now.
     pub fn pause(&self) {
         let until = now_ms() + SESSION_PAUSE_DURATION_MS;
         self.pause_until_ms.store(until, Ordering::Relaxed);
-        tracing::info!(until_ms = until, "session paused");
+        tracing::info!(until_ms = until, "poll loop paused");
     }
 
     /// Returns `true` if currently within the cooldown window.
@@ -40,11 +42,11 @@ impl SessionGuard {
         until.saturating_sub(now_ms())
     }
 
-    /// Returns `Ok(())` if active, or `Err(SessionExpired)` if paused.
-    #[allow(dead_code)] // Public API for consumers via WeixinClient
+    /// Returns `Ok(())` if active, or [`Error::TokenStale`] if paused.
+    #[allow(dead_code)] // Reserved for callers that want to gate work on the cooldown window.
     pub fn assert_active(&self) -> Result<()> {
         if self.is_paused() {
-            Err(Error::SessionExpired)
+            Err(Error::TokenStale)
         } else {
             Ok(())
         }
@@ -84,5 +86,12 @@ mod tests {
         let guard = SessionGuard::new();
         guard.pause();
         assert!(guard.assert_active().is_err());
+    }
+
+    #[test]
+    fn assert_active_returns_token_stale_when_paused() {
+        let guard = SessionGuard::new();
+        guard.pause();
+        assert!(matches!(guard.assert_active(), Err(Error::TokenStale)));
     }
 }

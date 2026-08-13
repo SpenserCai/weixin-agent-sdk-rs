@@ -7,9 +7,9 @@ use crate::error::{Error, Result};
 use crate::types::{
     BaseInfo, CHANNEL_VERSION, DEFAULT_CONFIG_TIMEOUT_MS, GetConfigRequest, GetConfigResponse,
     GetUpdatesRequest, GetUpdatesResponse, GetUploadUrlRequest, GetUploadUrlResponse, ILINK_APP_ID,
-    SendMessageRequest, SendTypingRequest, build_base_info_with_agent,
+    SendMessageRequest, SendMessageResponse, SendTypingRequest, build_base_info_with_agent,
 };
-use crate::util::redact;
+use crate::util::{net_error, redact};
 
 /// Encode version string as `(major<<16)|(minor<<8)|patch`.
 fn build_client_version(version: &str) -> u32 {
@@ -33,6 +33,51 @@ fn ensure_trailing_slash(url: &str) -> String {
         url.to_owned()
     } else {
         format!("{url}/")
+    }
+}
+
+/// Log a transport-level failure with a redacted URL and a failure category.
+///
+/// The error itself is deliberately **not** logged: `reqwest::Error` and its
+/// source chain can carry the full URL including its query string, which would
+/// defeat redaction (standards §1.3).
+fn log_transport_failure(method: &str, url: &str, timeout: Option<Duration>, err: &Error) {
+    let kind = net_error::classify(err);
+    tracing::error!(
+        method,
+        url = redact::redact_url(url),
+        timeout_ms = timeout.map(|t| u64::try_from(t.as_millis()).unwrap_or(u64::MAX)),
+        kind = kind.as_str(),
+        description = kind.description(),
+        "HTTP transport failure"
+    );
+}
+
+/// Validate a raw `sendMessage` response body.
+///
+/// Empty bodies and a missing `ret` are both success. This is not defensive
+/// guesswork — it is what the live endpoint actually returns (verified against
+/// the production API, 2026-08-13):
+///
+/// - text / media sends answer `{"message_id": <i64>}` — **no `ret` field**;
+/// - tool-call progress items (types 11 / 12) answer with an **empty body**.
+///
+/// Requiring `ret == 0`, or rejecting empty bodies the way the reference
+/// implementation's `JSON.parse` does, would therefore fail every successful
+/// send. A non-empty body must still be valid JSON: if it cannot be parsed we
+/// cannot tell success from failure, so that is surfaced as an error rather than
+/// assumed OK.
+pub(crate) fn validate_send_message_response(raw: &str) -> Result<()> {
+    if raw.trim().is_empty() {
+        return Ok(());
+    }
+    let resp: SendMessageResponse = serde_json::from_str(raw)?;
+    match resp.ret {
+        Some(ret) if ret != 0 => Err(Error::Api {
+            errcode: ret,
+            errmsg: resp.errmsg.unwrap_or_default(),
+        }),
+        _ => Ok(()),
     }
 }
 
@@ -86,12 +131,16 @@ impl HttpApiClient {
         h
     }
 
-    async fn post_json<T: serde::de::DeserializeOwned>(
+    /// POST a JSON body and return the raw response text.
+    ///
+    /// The single transport path for authenticated POSTs; [`Self::post_json`] is a
+    /// thin deserializing wrapper over it.
+    async fn post_raw(
         &self,
         endpoint: &str,
         body: &impl serde::Serialize,
         timeout: Option<Duration>,
-    ) -> Result<T> {
+    ) -> Result<String> {
         let url = format!("{}{endpoint}", self.base_url);
         let body_str = serde_json::to_string(body)?;
         tracing::debug!(
@@ -108,7 +157,14 @@ impl HttpApiClient {
             builder = builder.header(k, v);
         }
 
-        let response = builder.send().await?;
+        let response = match builder.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let err = Error::Http(e);
+                log_transport_failure("POST", &url, timeout, &err);
+                return Err(err);
+            }
+        };
         let status = response.status();
         let raw = response.text().await?;
         tracing::debug!(
@@ -122,6 +178,16 @@ impl HttpApiClient {
                 errmsg: raw,
             });
         }
+        Ok(raw)
+    }
+
+    async fn post_json<T: serde::de::DeserializeOwned>(
+        &self,
+        endpoint: &str,
+        body: &impl serde::Serialize,
+        timeout: Option<Duration>,
+    ) -> Result<T> {
+        let raw = self.post_raw(endpoint, body, timeout).await?;
         Ok(serde_json::from_str(&raw)?)
     }
 
@@ -158,11 +224,14 @@ impl HttpApiClient {
     }
 
     /// Send a message.
+    ///
+    /// Returns an error when the server reports a non-zero `ret`: an HTTP 200 with
+    /// a business-level failure means the message was **not** delivered.
     pub async fn send_message(&self, request: &SendMessageRequest) -> Result<()> {
-        let _: serde_json::Value = self
-            .post_json("ilink/bot/sendmessage", request, Some(self.api_timeout))
+        let raw = self
+            .post_raw("ilink/bot/sendmessage", request, Some(self.api_timeout))
             .await?;
-        Ok(())
+        validate_send_message_response(&raw)
     }
 
     /// Get a pre-signed CDN upload URL.
@@ -285,7 +354,14 @@ impl HttpApiClient {
             builder = builder.header(k, v);
         }
 
-        let response = builder.send().await?;
+        let response = match builder.send().await {
+            Ok(r) => r,
+            Err(e) => {
+                let err = Error::Http(e);
+                log_transport_failure("GET", &url, Some(timeout), &err);
+                return Err(err);
+            }
+        };
         let status = response.status();
         let raw = response.text().await?;
         if !status.is_success() {
@@ -335,5 +411,75 @@ mod tests {
             .unwrap();
         let s = std::str::from_utf8(&decoded).unwrap();
         assert!(s.parse::<u32>().is_ok());
+    }
+
+    #[test]
+    fn send_message_accepts_zero_ret() {
+        assert!(validate_send_message_response(r#"{"ret":0}"#).is_ok());
+    }
+
+    #[test]
+    fn send_message_accepts_absent_ret() {
+        assert!(validate_send_message_response("{}").is_ok());
+    }
+
+    #[test]
+    fn send_message_accepts_empty_body() {
+        assert!(validate_send_message_response("").is_ok());
+        assert!(validate_send_message_response("   \n").is_ok());
+    }
+
+    #[test]
+    fn send_message_rejects_non_zero_ret_with_errcode_and_msg() {
+        let err =
+            validate_send_message_response(r#"{"ret":-14,"errmsg":"stale token"}"#).unwrap_err();
+        match err {
+            Error::Api { errcode, errmsg } => {
+                assert_eq!(errcode, -14);
+                assert_eq!(errmsg, "stale token");
+            }
+            other => panic!("expected Error::Api, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn send_message_rejects_malformed_body() {
+        // Cannot tell success from failure → must not be assumed OK.
+        assert!(validate_send_message_response("not json").is_err());
+    }
+
+    /// End-to-end over the real HTTP path: an HTTP 200 carrying a business-level
+    /// failure must surface as an error, which the pure-function tests above
+    /// cannot prove on their own.
+    #[tokio::test]
+    async fn send_message_surfaces_server_ret_as_api_error() {
+        use crate::messaging::send::build_text_message;
+        use tokio::io::AsyncWriteExt;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            let (mut sock, _) = listener.accept().await.unwrap();
+            let body = r#"{"ret":-14,"errmsg":"stale token"}"#;
+            let resp = format!(
+                "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nContent-Type: application/json\r\n\r\n{body}",
+                body.len()
+            );
+            // No need to drain the request; reply and close.
+            let _ = sock.write_all(resp.as_bytes()).await;
+            let _ = sock.flush().await;
+        });
+
+        let cfg = WeixinConfig::builder()
+            .token("t")
+            .base_url(format!("http://{addr}/"))
+            .build()
+            .unwrap();
+        let api = HttpApiClient::new(&cfg);
+        let req = build_text_message("u1", "hi", None, None, api.base_info());
+        assert!(matches!(
+            api.send_message(&req).await,
+            Err(Error::Api { errcode: -14, .. })
+        ));
     }
 }

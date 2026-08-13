@@ -36,6 +36,14 @@ pub fn random_hex(n: usize) -> String {
         })
 }
 
+/// Generate a run ID (32 hex chars) for grouping one outbound run.
+///
+/// Carries UUID-equivalent entropy; the protocol field is an opaque string with
+/// no format requirement, so no `uuid` dependency is needed (standards §2.11).
+pub(crate) fn generate_run_id() -> String {
+    random_hex(16)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -72,5 +80,17 @@ mod tests {
         let mid = &name["upload-".len()..name.len() - ".png".len()];
         let parts: Vec<&str> = mid.splitn(2, '-').collect();
         assert_eq!(parts.len(), 2);
+    }
+
+    #[test]
+    fn run_id_is_32_hex_chars() {
+        let id = generate_run_id();
+        assert_eq!(id.len(), 32);
+        assert!(id.chars().all(|c| c.is_ascii_hexdigit()));
+    }
+
+    #[test]
+    fn run_ids_are_unique() {
+        assert_ne!(generate_run_id(), generate_run_id());
     }
 }

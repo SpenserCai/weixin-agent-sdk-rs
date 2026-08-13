@@ -25,8 +25,15 @@ pub enum Error {
         errmsg: String,
     },
 
-    /// Session expired; the monitor will pause for one hour.
-    #[error("Session expired for account, paused until cooldown")]
+    /// Bot token is stale; the poll loop has entered its cooldown window.
+    ///
+    /// Only long polling is paused — outbound calls are not blocked by the SDK.
+    #[error("bot token is stale (errcode -14), polling paused for cooldown")]
+    TokenStale,
+
+    /// Deprecated: use [`Error::TokenStale`].
+    #[deprecated(since = "0.3.0", note = "use Error::TokenStale")]
+    #[error("session expired for account, paused until cooldown")]
     SessionExpired,
 
     /// CDN upload failure.

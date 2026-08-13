@@ -8,13 +8,13 @@ use crate::cdn::upload::{CdnUploadResult, upload_file};
 use crate::error::Result;
 use crate::media::mime::get_mime_from_filename;
 use crate::messaging::inbound::SendResult;
-use crate::messaging::send::generate_client_id;
 use crate::types::{
-    BaseInfo, CdnMedia, FileItem, ImageItem, MessageItem, MessageItemType, MessageState,
-    MessageType, SendMessageRequest, UploadMediaType, VideoItem, WeixinMessage,
+    BaseInfo, CdnMedia, FileItem, ImageItem, MessageItem, MessageItemType, UploadMediaType,
+    VideoItem,
 };
 
 /// Upload a file and send it as a message, routing by MIME type.
+#[allow(clippy::too_many_arguments)] // Protocol envelope fields; assembled by MessageSender only.
 pub(crate) async fn send_media_file(
     api: &Arc<HttpApiClient>,
     cdn_base_url: &str,
@@ -22,6 +22,7 @@ pub(crate) async fn send_media_file(
     file_path: &Path,
     text: &str,
     context_token: Option<&str>,
+    run_id: Option<&str>,
     base_info: BaseInfo,
 ) -> Result<SendResult> {
     let filename = file_path
@@ -44,25 +45,24 @@ pub(crate) async fn send_media_file(
 
     // Send text and media as separate requests
     if !text.is_empty() {
-        let text_req =
-            crate::messaging::send::build_text_message(to, text, context_token, base_info.clone());
+        let text_req = crate::messaging::send::build_text_message(
+            to,
+            text,
+            context_token,
+            run_id,
+            base_info.clone(),
+        );
         api.send_message(&text_req).await?;
     }
 
-    let client_id = generate_client_id();
-    let req = SendMessageRequest {
-        msg: WeixinMessage {
-            from_user_id: Some(String::new()),
-            to_user_id: Some(to.to_owned()),
-            client_id: Some(client_id.clone()),
-            message_type: Some(MessageType::Bot),
-            message_state: Some(MessageState::Finish),
-            item_list: Some(vec![media_item]),
-            context_token: context_token.map(String::from),
-            ..Default::default()
-        },
+    let req = crate::messaging::send::build_item_message(
+        to,
+        media_item,
+        context_token,
+        run_id,
         base_info,
-    };
+    );
+    let client_id = req.msg.client_id.clone().unwrap_or_default();
     api.send_message(&req).await?;
 
     Ok(SendResult {

@@ -11,6 +11,8 @@ use crate::api::session_guard::SessionGuard;
 use crate::config::WeixinConfig;
 use crate::error::{Error, Result};
 use crate::messaging::inbound::{ContextTokenStore, SendResult};
+use crate::messaging::outbound_run::OutboundRun;
+use crate::messaging::sender::MessageSender;
 use crate::monitor::poll_loop::MessageHandler;
 use crate::qr_login::login::QrLoginApi;
 
@@ -19,8 +21,8 @@ pub struct WeixinClient {
     config: Arc<WeixinConfig>,
     handler: Arc<dyn MessageHandler>,
     api: Arc<HttpApiClient>,
+    sender: Arc<MessageSender>,
     session_guard: Arc<SessionGuard>,
-    config_cache: Arc<ConfigCache>,
     context_tokens: Arc<ContextTokenStore>,
     cancel: CancellationToken,
 }
@@ -48,20 +50,24 @@ impl WeixinClient {
     /// `initial_sync_buf` should be loaded from your persistence layer (or `None` for fresh start).
     pub async fn start(&self, initial_sync_buf: Option<String>) -> Result<()> {
         if let Err(e) = self.api.notify_start().await {
-            tracing::warn!(error = %e, "notify_start failed");
+            // Best-effort call; `post_raw` already logged the classified transport
+            // failure. The error text is not repeated here because it can carry an
+            // un-redacted URL (standards §1.3).
+            tracing::warn!(
+                kind = crate::util::net_error::classify(&e).as_str(),
+                "notify_start failed"
+            );
         }
 
         crate::monitor::poll_loop::run_monitor(
             Arc::clone(&self.api),
-            self.config.cdn_base_url.clone(),
+            Arc::clone(&self.sender),
             Arc::clone(&self.handler),
             Arc::clone(&self.session_guard),
-            Arc::clone(&self.config_cache),
             Arc::clone(&self.context_tokens),
             initial_sync_buf,
             self.config.long_poll_timeout,
             self.cancel.clone(),
-            self.config.markdown_filter_enabled,
         )
         .await
     }
@@ -78,15 +84,7 @@ impl WeixinClient {
         text: &str,
         context_token: Option<&str>,
     ) -> Result<SendResult> {
-        crate::messaging::send::send_text(
-            &self.api,
-            to,
-            text,
-            context_token,
-            self.config.markdown_filter_enabled,
-            self.api.base_info(),
-        )
-        .await
+        self.sender.send_text(to, text, context_token, None).await
     }
 
     /// Send a media file to a user.
@@ -96,16 +94,17 @@ impl WeixinClient {
         file_path: &Path,
         context_token: Option<&str>,
     ) -> Result<SendResult> {
-        crate::messaging::send_media::send_media_file(
-            &self.api,
-            &self.config.cdn_base_url,
-            to,
-            file_path,
-            "",
-            context_token,
-            self.api.base_info(),
-        )
-        .await
+        self.sender
+            .send_media(to, file_path, context_token, None)
+            .await
+    }
+
+    /// Start an outbound run addressed to `to`.
+    ///
+    /// Every message sent through the returned handle carries the same `run_id`,
+    /// which lets the peer group them as one logical run.
+    pub fn run(&self, to: &str, context_token: Option<&str>) -> OutboundRun {
+        self.sender.run(to, context_token)
     }
 
     /// Get a QR login API handle.
@@ -139,12 +138,18 @@ impl WeixinClientBuilder {
             .ok_or_else(|| Error::Config("message handler is required".into()))?;
         let api = Arc::new(HttpApiClient::new(&self.config));
         let config_cache = Arc::new(ConfigCache::new(Arc::clone(&api)));
+        let sender = Arc::new(MessageSender {
+            api: Arc::clone(&api),
+            cdn_base_url: self.config.cdn_base_url.clone(),
+            config_cache,
+            markdown_filter_enabled: self.config.markdown_filter_enabled,
+        });
         Ok(WeixinClient {
             config: Arc::new(self.config),
             handler,
             api,
+            sender,
             session_guard: Arc::new(SessionGuard::new()),
-            config_cache,
             context_tokens: Arc::new(ContextTokenStore::new()),
             cancel: self.cancel,
         })

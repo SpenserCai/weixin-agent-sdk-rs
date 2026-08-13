@@ -8,13 +8,21 @@ use serde_repr::{Deserialize_repr, Serialize_repr};
 /// iLink-App-Id header value.
 pub const ILINK_APP_ID: &str = "bot";
 /// Channel version sent in `base_info`.
-pub const CHANNEL_VERSION: &str = "2.4.3";
+pub const CHANNEL_VERSION: &str = "2.4.6";
 /// Fixed QR code base URL.
 pub const QR_CODE_BASE_URL: &str = "https://ilinkai.weixin.qq.com/";
 /// Default bot type for QR login.
 pub const DEFAULT_ILINK_BOT_TYPE: &str = "3";
-/// Session-expired error code from server.
-pub const SESSION_EXPIRED_ERRCODE: i32 = -14;
+/// Error code returned when the bot token is stale / invalid.
+///
+/// The bot must be re-authenticated (QR login) before polling can resume.
+pub const STALE_TOKEN_ERRCODE: i32 = -14;
+/// Deprecated alias of [`STALE_TOKEN_ERRCODE`].
+#[deprecated(
+    since = "0.3.0",
+    note = "use STALE_TOKEN_ERRCODE — -14 means the token is stale, not the session"
+)]
+pub const SESSION_EXPIRED_ERRCODE: i32 = STALE_TOKEN_ERRCODE;
 /// Text chunk limit (characters).
 pub const TEXT_CHUNK_LIMIT: usize = 4000;
 
@@ -26,7 +34,7 @@ pub const DEFAULT_LONG_POLL_TIMEOUT_MS: u64 = 35_000;
 pub const DEFAULT_API_TIMEOUT_MS: u64 = 15_000;
 /// Config/typing API timeout.
 pub const DEFAULT_CONFIG_TIMEOUT_MS: u64 = 10_000;
-/// Session pause after expiry.
+/// Poll-loop pause after the server reports a stale token.
 pub const SESSION_PAUSE_DURATION_MS: u64 = 3_600_000;
 /// Max consecutive poll failures before backoff.
 pub const MAX_CONSECUTIVE_FAILURES: u32 = 3;
@@ -48,6 +56,7 @@ pub const DEFAULT_QR_POLL_TIMEOUT_MS: u64 = 35_000;
 /// CDN upload media type.
 #[derive(Debug, Clone, Copy, Serialize_repr, Deserialize_repr, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum UploadMediaType {
     /// Image upload.
     Image = 1,
@@ -60,53 +69,178 @@ pub enum UploadMediaType {
 }
 
 /// Message sender type.
-#[derive(Debug, Clone, Copy, Default, Serialize_repr, Deserialize_repr, PartialEq, Eq)]
-#[repr(u8)]
+///
+/// Unknown wire values are preserved in [`MessageType::Unknown`] instead of
+/// failing deserialization — see [`MessageItemType`] for the rationale.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MessageType {
     /// Unset.
     #[default]
-    None = 0,
+    None,
     /// From a human user.
-    User = 1,
+    User,
     /// From a bot.
-    Bot = 2,
+    Bot,
+    /// Wire value not known to this SDK version.
+    Unknown(i32),
+}
+
+impl MessageType {
+    /// Wire value for this variant.
+    pub fn code(self) -> i32 {
+        match self {
+            Self::None => 0,
+            Self::User => 1,
+            Self::Bot => 2,
+            Self::Unknown(n) => n,
+        }
+    }
+
+    /// Build from a wire value; unrecognized values map to [`MessageType::Unknown`].
+    pub fn from_code(code: i32) -> Self {
+        match code {
+            0 => Self::None,
+            1 => Self::User,
+            2 => Self::Bot,
+            n => Self::Unknown(n),
+        }
+    }
 }
 
 /// Message item content type.
-#[derive(Debug, Clone, Copy, Default, Serialize_repr, Deserialize_repr, PartialEq, Eq)]
-#[repr(u8)]
+///
+/// Unknown wire values are preserved in [`MessageItemType::Unknown`] instead of
+/// failing deserialization — the protocol adds item types over time, and one
+/// unrecognized item must not invalidate an entire `getUpdates` batch.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MessageItemType {
     /// Unset.
     #[default]
-    None = 0,
+    None,
     /// Text content.
-    Text = 1,
+    Text,
     /// Image content.
-    Image = 2,
+    Image,
     /// Voice content.
-    Voice = 3,
+    Voice,
     /// File attachment.
-    File = 4,
+    File,
     /// Video content.
-    Video = 5,
+    Video,
+    /// Tool call started (progress message).
+    ToolCallStart,
+    /// Tool call finished (progress message).
+    ToolCallResult,
+    /// Wire value not known to this SDK version.
+    Unknown(i32),
+}
+
+impl MessageItemType {
+    /// Wire value for this variant.
+    pub fn code(self) -> i32 {
+        match self {
+            Self::None => 0,
+            Self::Text => 1,
+            Self::Image => 2,
+            Self::Voice => 3,
+            Self::File => 4,
+            Self::Video => 5,
+            Self::ToolCallStart => 11,
+            Self::ToolCallResult => 12,
+            Self::Unknown(n) => n,
+        }
+    }
+
+    /// Build from a wire value; unrecognized values map to [`MessageItemType::Unknown`].
+    pub fn from_code(code: i32) -> Self {
+        match code {
+            0 => Self::None,
+            1 => Self::Text,
+            2 => Self::Image,
+            3 => Self::Voice,
+            4 => Self::File,
+            5 => Self::Video,
+            11 => Self::ToolCallStart,
+            12 => Self::ToolCallResult,
+            n => Self::Unknown(n),
+        }
+    }
 }
 
 /// Message generation state.
-#[derive(Debug, Clone, Copy, Default, Serialize_repr, Deserialize_repr, PartialEq, Eq)]
-#[repr(u8)]
+///
+/// Unknown wire values are preserved in [`MessageState::Unknown`] instead of
+/// failing deserialization — see [`MessageItemType`] for the rationale.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MessageState {
     /// New / finished.
     #[default]
-    New = 0,
+    New,
     /// Still generating (streaming).
-    Generating = 1,
+    Generating,
     /// Generation complete.
-    Finish = 2,
+    Finish,
+    /// Wire value not known to this SDK version.
+    Unknown(i32),
 }
+
+impl MessageState {
+    /// Wire value for this variant.
+    pub fn code(self) -> i32 {
+        match self {
+            Self::New => 0,
+            Self::Generating => 1,
+            Self::Finish => 2,
+            Self::Unknown(n) => n,
+        }
+    }
+
+    /// Build from a wire value; unrecognized values map to [`MessageState::Unknown`].
+    pub fn from_code(code: i32) -> Self {
+        match code {
+            0 => Self::New,
+            1 => Self::Generating,
+            2 => Self::Finish,
+            n => Self::Unknown(n),
+        }
+    }
+}
+
+/// Implement `Serialize`/`Deserialize` as a bare protocol integer, preserving
+/// unknown values. Replaces `serde_repr`, which cannot express a data-carrying
+/// fallback variant (standards §2.7 exception).
+macro_rules! impl_wire_int_serde {
+    ($ty:ty) => {
+        impl Serialize for $ty {
+            fn serialize<S: serde::Serializer>(
+                &self,
+                serializer: S,
+            ) -> std::result::Result<S::Ok, S::Error> {
+                serializer.serialize_i32(self.code())
+            }
+        }
+
+        impl<'de> Deserialize<'de> for $ty {
+            fn deserialize<D: serde::Deserializer<'de>>(
+                deserializer: D,
+            ) -> std::result::Result<Self, D::Error> {
+                Ok(Self::from_code(i32::deserialize(deserializer)?))
+            }
+        }
+    };
+}
+
+impl_wire_int_serde!(MessageType);
+impl_wire_int_serde!(MessageItemType);
+impl_wire_int_serde!(MessageState);
 
 /// Typing indicator status.
 #[derive(Debug, Clone, Copy, Serialize_repr, Deserialize_repr, PartialEq, Eq)]
 #[repr(u8)]
+#[non_exhaustive]
 pub enum TypingStatus {
     /// Currently typing.
     Typing = 1,
@@ -116,6 +250,7 @@ pub enum TypingStatus {
 
 /// High-level media type for inbound messages.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
 pub enum MediaType {
     /// Image media.
     Image,
@@ -125,6 +260,32 @@ pub enum MediaType {
     Voice,
     /// Generic file.
     File,
+}
+
+/// Outcome of a tool call, as reported to the peer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum ToolCallStatus {
+    /// Finished successfully.
+    Completed,
+    /// Finished with an error.
+    Failed,
+    /// Blocked (e.g. awaiting authorization).
+    Blocked,
+    /// Outcome not determined.
+    Unknown,
+}
+
+impl ToolCallStatus {
+    /// Wire representation.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Completed => "completed",
+            Self::Failed => "failed",
+            Self::Blocked => "blocked",
+            Self::Unknown => "unknown",
+        }
+    }
 }
 
 // ── BaseInfo ────────────────────────────────────────────────────────
@@ -292,6 +453,33 @@ pub struct RefMessage {
     pub title: Option<String>,
 }
 
+/// Tool call start payload (item type 11).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ToolCallStartItem {
+    /// Tool name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Caller-assigned tool call ID, used to pair start with result.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+}
+
+/// Tool call result payload (item type 12).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[non_exhaustive]
+pub struct ToolCallResultItem {
+    /// Tool name.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_name: Option<String>,
+    /// Tool call ID matching the corresponding start item.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<String>,
+    /// Normalized status string (see [`ToolCallStatus::as_str`]).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub status: Option<String>,
+}
+
 /// A single content item within a message.
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct MessageItem {
@@ -328,6 +516,12 @@ pub struct MessageItem {
     /// Video content.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub video_item: Option<VideoItem>,
+    /// Tool call start content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_start_item: Option<ToolCallStartItem>,
+    /// Tool call result content.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub tool_call_result_item: Option<ToolCallResultItem>,
 }
 
 // ── WeixinMessage ───────────────────────────────────────────────────
@@ -377,6 +571,9 @@ pub struct WeixinMessage {
     /// Context token for replies.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_token: Option<String>,
+    /// Run ID grouping all messages of one logical outbound run.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub run_id: Option<String>,
 }
 
 // ── API request / response types ────────────────────────────────────
@@ -423,6 +620,17 @@ pub struct SendMessageRequest {
     pub msg: WeixinMessage,
     /// Metadata.
     pub base_info: BaseInfo,
+}
+
+/// `sendMessage` response body (internal).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub(crate) struct SendMessageResponse {
+    /// Return code (0 or absent = success).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub ret: Option<i32>,
+    /// Error message.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub errmsg: Option<String>,
 }
 
 /// `getUploadUrl` request body.
@@ -543,4 +751,132 @@ pub struct QrStatusResponse {
     /// Redirect host for IDC redirect.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub redirect_host: Option<String>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn item_type_round_trips_known_values() {
+        for code in [0, 1, 2, 3, 4, 5, 11, 12] {
+            assert_eq!(MessageItemType::from_code(code).code(), code);
+        }
+    }
+
+    #[test]
+    fn item_type_preserves_unknown_value() {
+        let t = MessageItemType::from_code(99);
+        assert_eq!(t, MessageItemType::Unknown(99));
+        assert_eq!(t.code(), 99);
+    }
+
+    #[test]
+    fn item_type_serializes_as_wire_int() {
+        assert_eq!(
+            serde_json::to_string(&MessageItemType::ToolCallStart).unwrap(),
+            "11"
+        );
+        assert_eq!(
+            serde_json::to_string(&MessageItemType::ToolCallResult).unwrap(),
+            "12"
+        );
+        assert_eq!(
+            serde_json::to_string(&MessageItemType::Unknown(77)).unwrap(),
+            "77"
+        );
+    }
+
+    #[test]
+    fn unknown_item_type_does_not_break_batch() {
+        // Regression: one unrecognized item must not invalidate the whole getUpdates batch.
+        let json = r#"{"ret":0,"msgs":[
+            {"message_type":1,"from_user_id":"u1","item_list":[{"type":1,"text_item":{"text":"hi"}}]},
+            {"message_type":2,"item_list":[{"type":11,"tool_call_start_item":{"tool_name":"bash"}}]},
+            {"message_type":2,"item_list":[{"type":99}]}
+        ]}"#;
+        let resp: GetUpdatesResponse = serde_json::from_str(json).unwrap();
+        let msgs = resp.msgs.unwrap();
+        assert_eq!(msgs.len(), 3);
+        assert_eq!(
+            msgs[1].item_list.as_ref().unwrap()[0].item_type,
+            Some(MessageItemType::ToolCallStart)
+        );
+        assert_eq!(
+            msgs[2].item_list.as_ref().unwrap()[0].item_type,
+            Some(MessageItemType::Unknown(99))
+        );
+    }
+
+    #[test]
+    fn unknown_message_state_does_not_break_parse() {
+        let json = r#"{"ret":0,"msgs":[{"message_type":1,"message_state":3}]}"#;
+        let resp: GetUpdatesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resp.msgs.unwrap()[0].message_state,
+            Some(MessageState::Unknown(3))
+        );
+    }
+
+    #[test]
+    fn unknown_message_type_does_not_break_parse() {
+        let json = r#"{"ret":0,"msgs":[{"message_type":7}]}"#;
+        let resp: GetUpdatesResponse = serde_json::from_str(json).unwrap();
+        assert_eq!(
+            resp.msgs.unwrap()[0].message_type,
+            Some(MessageType::Unknown(7))
+        );
+    }
+
+    #[test]
+    fn run_id_deserializes_and_serializes() {
+        let msg: WeixinMessage = serde_json::from_str(r#"{"run_id":"abc123"}"#).unwrap();
+        assert_eq!(msg.run_id.as_deref(), Some("abc123"));
+        let json = serde_json::to_string(&msg).unwrap();
+        assert!(json.contains(r#""run_id":"abc123""#));
+        // Absent run_id must not be serialized.
+        let empty = WeixinMessage::default();
+        assert!(!serde_json::to_string(&empty).unwrap().contains("run_id"));
+    }
+
+    #[test]
+    fn tool_call_status_wire_strings() {
+        assert_eq!(ToolCallStatus::Completed.as_str(), "completed");
+        assert_eq!(ToolCallStatus::Failed.as_str(), "failed");
+        assert_eq!(ToolCallStatus::Blocked.as_str(), "blocked");
+        assert_eq!(ToolCallStatus::Unknown.as_str(), "unknown");
+    }
+
+    #[test]
+    fn channel_version_matches_reference() {
+        assert_eq!(CHANNEL_VERSION, "2.4.6");
+        assert_eq!(STALE_TOKEN_ERRCODE, -14);
+    }
+
+    #[test]
+    fn send_message_response_parses_error_and_empty_object() {
+        let err: SendMessageResponse =
+            serde_json::from_str(r#"{"ret":-14,"errmsg":"stale"}"#).unwrap();
+        assert_eq!(err.ret, Some(-14));
+        assert_eq!(err.errmsg.as_deref(), Some("stale"));
+        let ok: SendMessageResponse = serde_json::from_str("{}").unwrap();
+        assert!(ok.ret.is_none());
+    }
+
+    #[test]
+    fn item_type_round_trips_i32_bounds_through_serde() {
+        // Must go through serde, not just from_code/code — the risk is at the wire layer.
+        for code in [i32::MIN, -1, i32::MAX] {
+            let t = MessageItemType::from_code(code);
+            let json = serde_json::to_string(&t).unwrap();
+            assert_eq!(json, code.to_string());
+            assert_eq!(serde_json::from_str::<MessageItemType>(&json).unwrap(), t);
+        }
+    }
+
+    #[test]
+    fn item_type_rejects_out_of_i32_range() {
+        // Values beyond i32 must fail rather than being silently truncated.
+        assert!(serde_json::from_str::<MessageItemType>("2147483648").is_err());
+    }
 }

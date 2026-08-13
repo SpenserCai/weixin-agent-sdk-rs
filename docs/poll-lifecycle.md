@@ -27,8 +27,9 @@ sequenceDiagram
             API-->>Monitor: (timeout)
             Note over Monitor: 视为空响应<br/>不增加失败计数
         else errcode == -14
-            API-->>Monitor: Session 过期
-            Monitor->>Monitor: session_guard.pause()<br/>暂停 1 小时
+            API-->>Monitor: Token 失效（stale token）
+            Monitor->>Handler: handler.on_token_stale(info)
+            Monitor->>Monitor: session_guard.pause()<br/>暂停长轮询 1 小时
         else 其他错误
             API-->>Monitor: 错误
             Monitor->>Monitor: 连续失败 < 3 → 等 2s<br/>连续失败 ≥ 3 → 等 30s
@@ -39,6 +40,8 @@ sequenceDiagram
     Client->>Handler: handler.on_shutdown()
 ```
 
+取消（`shutdown()` 或注入的 `CancellationToken`）会立即中止正在进行的长轮询请求，无需等待其超时。
+
 ## 关键参数
 
 | 参数 | 值 | 说明 |
@@ -47,7 +50,7 @@ sequenceDiagram
 | 最大连续失败 | 3 次 | 超过后进入退避 |
 | 退避延迟 | 30s | 连续失败 ≥ 3 |
 | 重试延迟 | 2s | 连续失败 < 3 |
-| Session 暂停 | 1 小时 | errcode == -14 |
+| 长轮询暂停 | 1 小时 | errcode == -14（Token 失效）；主动出站调用不受影响 |
 
 ## 消息过滤规则
 

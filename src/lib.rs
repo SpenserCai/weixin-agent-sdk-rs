@@ -49,8 +49,13 @@ pub use messaging::inbound::{
     ContextTokenStore, MediaInfo, MessageContext, RefMessageInfo, SendResult,
 };
 pub use messaging::markdown_filter::{StreamingMarkdownFilter, filter_markdown};
-pub use monitor::poll_loop::MessageHandler;
+pub use messaging::outbound_run::OutboundRun;
+pub use monitor::poll_loop::{MessageHandler, TokenStaleInfo};
 pub use qr_login::login::{LoginStatus, QrLoginApi, QrLoginSession, StandaloneQrLogin};
+#[allow(deprecated)] // Re-exported so existing callers of the old name keep compiling.
+pub use types::SESSION_EXPIRED_ERRCODE;
 pub use types::{
-    CdnMedia, MediaType, MessageItemType, MessageState, MessageType, TypingStatus, UploadMediaType,
+    CdnMedia, MediaType, MessageItemType, MessageState, MessageType, STALE_TOKEN_ERRCODE,
+    ToolCallResultItem, ToolCallStartItem, ToolCallStatus, TypingStatus, UploadMediaType,
 };
+pub use util::net_error::NetErrorKind;

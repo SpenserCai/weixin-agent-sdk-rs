@@ -1,4 +1,4 @@
-//! Long-poll `getUpdates` loop with error handling, backoff, and session guard.
+//! Long-poll `getUpdates` loop with error handling, backoff, and cooldown guard.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -6,14 +6,25 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use crate::api::client::HttpApiClient;
-use crate::api::config_cache::ConfigCache;
 use crate::api::session_guard::SessionGuard;
 use crate::error::Result;
-use crate::messaging::inbound::{self, ContextTokenStore, MessageSender};
+use crate::messaging::inbound::{self, ContextTokenStore};
+use crate::messaging::sender::MessageSender;
 use crate::types::{
     BACKOFF_DELAY_MS, GetUpdatesRequest, MAX_CONSECUTIVE_FAILURES, RETRY_DELAY_MS,
-    SESSION_EXPIRED_ERRCODE,
+    STALE_TOKEN_ERRCODE,
 };
+use crate::util::net_error;
+
+/// Details of a stale-token event.
+#[derive(Debug, Clone)]
+#[non_exhaustive]
+pub struct TokenStaleInfo {
+    /// Error code reported by the server (`-14`).
+    pub errcode: i32,
+    /// How long the SDK will pause polling before trying again.
+    pub pause_duration: Duration,
+}
 
 /// The handler trait users implement to receive messages.
 #[async_trait::async_trait]
@@ -23,6 +34,20 @@ pub trait MessageHandler: Send + Sync {
 
     /// Called when `get_updates_buf` changes — persist it here.
     async fn on_sync_buf_updated(&self, _sync_buf: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Called when the server reports that the bot token is stale.
+    ///
+    /// The SDK then pauses the poll loop for the cooldown window. Persist the
+    /// account state here (e.g. mark it as needing re-authentication). Errors
+    /// returned from this hook are logged and do not stop the loop.
+    ///
+    /// To stop the loop immediately, hold a `CancellationToken` shared with the
+    /// client via [`crate::WeixinClientBuilder::with_cancel_token`] and cancel it
+    /// here — the handler is moved into the builder, so it cannot hold the
+    /// [`crate::WeixinClient`] itself.
+    async fn on_token_stale(&self, _info: &TokenStaleInfo) -> Result<()> {
         Ok(())
     }
 
@@ -38,18 +63,19 @@ pub trait MessageHandler: Send + Sync {
 }
 
 /// Run the long-poll monitor loop. Blocks until cancellation.
+// 8 arguments: the outbound engine, guard, token store, and cancellation token are
+// independent collaborators owned by `WeixinClient`; bundling them into a struct
+// would only move the same list one level down.
 #[allow(clippy::too_many_arguments, clippy::too_many_lines)]
 pub(crate) async fn run_monitor(
     api: Arc<HttpApiClient>,
-    cdn_base_url: String,
+    sender: Arc<MessageSender>,
     handler: Arc<dyn MessageHandler>,
     session_guard: Arc<SessionGuard>,
-    config_cache: Arc<ConfigCache>,
     context_tokens: Arc<ContextTokenStore>,
     initial_sync_buf: Option<String>,
     initial_timeout: Duration,
     cancel: CancellationToken,
-    markdown_filter_enabled: bool,
 ) -> Result<()> {
     handler.on_start().await?;
 
@@ -57,22 +83,15 @@ pub(crate) async fn run_monitor(
     let mut next_timeout = initial_timeout;
     let mut consecutive_failures: u32 = 0;
 
-    let sender = Arc::new(MessageSender {
-        api: Arc::clone(&api),
-        cdn_base_url: cdn_base_url.clone(),
-        config_cache: Arc::clone(&config_cache),
-        markdown_filter_enabled,
-    });
-
     loop {
         if cancel.is_cancelled() {
             break;
         }
 
-        // Check session guard
+        // Check the cooldown guard
         if session_guard.is_paused() {
             let remaining = session_guard.remaining_ms();
-            tracing::info!(remaining_ms = remaining, "session paused, sleeping");
+            tracing::info!(remaining_ms = remaining, "poll loop paused, sleeping");
             tokio::select! {
                 () = cancel.cancelled() => break,
                 () = tokio::time::sleep(Duration::from_millis(remaining)) => continue,
@@ -91,10 +110,14 @@ pub(crate) async fn run_monitor(
                     Ok(r) => r,
                     Err(e) => {
                         consecutive_failures += 1;
+                        let kind = net_error::classify(&e);
+                        // The error text is not logged: it can carry an un-redacted
+                        // URL with its query string (standards §1.3).
                         tracing::error!(
-                            error = %e,
+                            kind = kind.as_str(),
+                            description = kind.description(),
                             failures = consecutive_failures,
-                            "getUpdates error"
+                            "getUpdates transport failure"
                         );
                         if consecutive_failures >= MAX_CONSECUTIVE_FAILURES {
                             consecutive_failures = 0;
@@ -119,15 +142,22 @@ pub(crate) async fn run_monitor(
         let is_error = resp.ret.unwrap_or(0) != 0 || resp.errcode.unwrap_or(0) != 0;
         if is_error {
             let errcode = resp.errcode.or(resp.ret).unwrap_or(0);
-            if errcode == SESSION_EXPIRED_ERRCODE {
+            if errcode == STALE_TOKEN_ERRCODE {
                 session_guard.pause();
                 consecutive_failures = 0;
                 let remaining = session_guard.remaining_ms();
                 tracing::error!(
                     errcode,
-                    remaining_min = remaining / 60_000,
-                    "session expired, pausing"
+                    pause_min = remaining / 60_000,
+                    "bot token is stale, pausing poll loop"
                 );
+                let info = TokenStaleInfo {
+                    errcode,
+                    pause_duration: Duration::from_millis(remaining),
+                };
+                if let Err(e) = handler.on_token_stale(&info).await {
+                    tracing::error!(error = %e, "on_token_stale failed");
+                }
                 sleep_or_cancel(Duration::from_millis(remaining), &cancel).await;
                 continue;
             }
@@ -190,7 +220,12 @@ pub(crate) async fn run_monitor(
     }
 
     if let Err(e) = api.notify_stop().await {
-        tracing::warn!(error = %e, "notify_stop failed");
+        // Best-effort; the classified transport failure is already logged by the
+        // API client, and the error text may carry an un-redacted URL.
+        tracing::warn!(
+            kind = net_error::classify(&e).as_str(),
+            "notify_stop failed"
+        );
     }
 
     handler.on_shutdown().await?;

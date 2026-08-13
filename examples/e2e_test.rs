@@ -18,6 +18,14 @@
 //!   echo <text>       → echo back
 //!   typing            → show typing 3s then reply
 //!   info              → message details (debug)
+//!   toolcall          → mocked tool-call run: start → 2s work → result → final text
+//!   toolcall fail     → same, reporting Failed
+//!   toolcall blocked  → same, reporting Blocked
+//!   toolcall multi    → three sequential tool calls, then the final answer
+//!   toolcall noid     → tool call without a tool_call_id
+//!   runid same        → two texts sharing one run_id
+//!   runid split       → progress on run A, final text on run B
+//!   refinfo           → echo the quoted message's referenced_msg_id
 //!   help              → command list
 //!   [图片]            → reply image info + optional download
 //!   [视频]            → reply video info + optional download
@@ -32,7 +40,8 @@ use std::time::Duration;
 
 use clap::{Parser, Subcommand};
 use weixin_agent::{
-    MediaInfo, MediaType, MessageContext, MessageHandler, Result, WeixinClient, WeixinConfig,
+    MediaInfo, MediaType, MessageContext, MessageHandler, Result, TokenStaleInfo, ToolCallStatus,
+    WeixinClient, WeixinConfig,
 };
 
 // ─── CLI ────────────────────────────────────────────────────────────
@@ -117,6 +126,13 @@ impl MessageHandler for E2eHandler {
             if let Some(body) = &ref_msg.body {
                 reply += &format!("\n内容: {}", truncate(body, 100));
             }
+            reply += &format!(
+                "\nreferenced_msg_id: {}",
+                ref_msg
+                    .referenced_msg_id
+                    .as_deref()
+                    .unwrap_or("(服务端未下发)")
+            );
             reply += &format!("\n\n你的回复: {text}");
             ctx.reply_text(&reply).await?;
             return Ok(());
@@ -130,6 +146,18 @@ impl MessageHandler for E2eHandler {
         if let Err(e) = common::save_sync_buf(&self.user_dir, sync_buf).await {
             tracing::error!(error = %e, "failed to save sync_buf");
         }
+        Ok(())
+    }
+
+    async fn on_token_stale(&self, info: &TokenStaleInfo) -> Result<()> {
+        // The SDK pauses polling for the cooldown window; whether to stop the loop
+        // is an application-level policy decision, so this example only reports it.
+        println!(
+            "[{}] ⚠️ token 已失效 (errcode={}, 冷却 {:?})；应用层应标记该账号需重新扫码登录",
+            user_label(&self.user_dir),
+            info.errcode,
+            info.pause_duration,
+        );
         Ok(())
     }
 
@@ -188,6 +216,23 @@ impl E2eHandler {
                 );
                 ctx.reply_text(&info).await?;
             }
+            t if t.starts_with("toolcall") => {
+                let variant = t.strip_prefix("toolcall").unwrap_or("").trim();
+                self.handle_tool_call(ctx, variant).await?;
+            }
+            t if t.starts_with("runid") => {
+                let variant = t.strip_prefix("runid").unwrap_or("").trim();
+                self.handle_run_id(ctx, variant).await?;
+            }
+            "refinfo" => {
+                // A quoted delivery is answered by the ref_message branch in
+                // `on_message`; reaching here means this message carried no quote.
+                ctx.reply_text(
+                    "ℹ️ refinfo: 请「引用」一条历史消息后再发送 refinfo，\n\
+                     回复中会包含 ref_message.referenced_msg_id 的实际取值。",
+                )
+                .await?;
+            }
             "help" | "" => {
                 ctx.reply_text(
                     "🤖 E2E 测试机器人\n\n\
@@ -196,6 +241,9 @@ impl E2eHandler {
                      • echo <文本> → 回声\n\
                      • typing → 输入状态测试\n\
                      • info → 消息详情\n\
+                     • toolcall [fail|blocked|multi|noid] → 工具调用进度流程\n\
+                     • runid [same|split] → run_id 分组验证\n\
+                     • refinfo → 引用消息 id（需先引用一条消息）\n\
                      • help → 本帮助\n\n\
                      媒体:\n\
                      • 发送图片/视频/文件/语音 → 回复详情\n\
@@ -211,12 +259,98 @@ impl E2eHandler {
         Ok(())
     }
 
+    /// Mocked tool-call run: a full start → work → result → answer sequence.
+    ///
+    /// The delay stands in for real tool execution, so the peer observes the same
+    /// interleaving a real agent would produce. Calls are awaited in order, which
+    /// is what guarantees ordering (see `OutboundRun`).
+    async fn handle_tool_call(&self, ctx: &MessageContext, variant: &str) -> Result<()> {
+        let run = ctx.run();
+        let label = user_label(&self.user_dir);
+        println!(
+            "[{label}] toolcall variant='{variant}' run_id={}",
+            run.run_id()
+        );
+
+        match variant {
+            "multi" => {
+                for (i, tool) in ["read_file", "bash", "write_file"].iter().enumerate() {
+                    let call_id = format!("call-{}", i + 1);
+                    run.tool_call_start(tool, Some(&call_id)).await?;
+                    tokio::time::sleep(Duration::from_millis(1_500)).await;
+                    run.tool_call_result(tool, Some(&call_id), ToolCallStatus::Completed)
+                        .await?;
+                }
+                run.send_text("✅ 3 个工具调用全部完成（最终答案）").await?;
+            }
+            "noid" => {
+                run.tool_call_start("bash", None).await?;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                run.tool_call_result("bash", None, ToolCallStatus::Completed)
+                    .await?;
+                run.send_text("✅ 无 tool_call_id 的工具调用完成").await?;
+            }
+            _ => {
+                let status = match variant {
+                    "fail" => ToolCallStatus::Failed,
+                    "blocked" => ToolCallStatus::Blocked,
+                    _ => ToolCallStatus::Completed,
+                };
+                let call_id = format!("call-{}", run.run_id());
+                run.tool_call_start("bash", Some(&call_id)).await?;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                run.tool_call_result("bash", Some(&call_id), status).await?;
+                run.send_text(&format!(
+                    "✅ 工具调用流程完成 (status={}, run_id={})",
+                    status.as_str(),
+                    run.run_id()
+                ))
+                .await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// Verify how `run_id` affects grouping on the client side.
+    async fn handle_run_id(&self, ctx: &MessageContext, variant: &str) -> Result<()> {
+        match variant {
+            "split" => {
+                // Progress on run A, final answer on run B — if run_id drives
+                // grouping, these must render as two separate runs.
+                let run_a = ctx.run();
+                let run_b = ctx.run();
+                run_a.tool_call_start("bash", Some("split-1")).await?;
+                tokio::time::sleep(Duration::from_secs(2)).await;
+                run_a
+                    .tool_call_result("bash", Some("split-1"), ToolCallStatus::Completed)
+                    .await?;
+                run_b
+                    .send_text(&format!(
+                        "🔀 最终答案在另一个 run（进度 run={}, 文本 run={}）",
+                        run_a.run_id(),
+                        run_b.run_id()
+                    ))
+                    .await?;
+            }
+            _ => {
+                let run = ctx.run();
+                run.send_text(&format!("1/2 同一 run_id={}", run.run_id()))
+                    .await?;
+                tokio::time::sleep(Duration::from_secs(1)).await;
+                run.send_text("2/2 同一 run_id（应与上一条同组）").await?;
+            }
+        }
+        Ok(())
+    }
+
     async fn handle_media(&self, ctx: &MessageContext, media: &MediaInfo) -> Result<()> {
         let type_name = match media.media_type {
             MediaType::Image => "🖼️ 图片",
             MediaType::Video => "🎬 视频",
             MediaType::File => "📄 文件",
             MediaType::Voice => "🎤 语音",
+            // MediaType is #[non_exhaustive]: newer SDKs may add categories.
+            _ => "📦 其他媒体",
         };
 
         let mut reply = format!(
@@ -255,6 +389,8 @@ impl E2eHandler {
                 .as_deref()
                 .and_then(|n| n.rfind('.').map(|i| &n[i..]))
                 .unwrap_or(".bin"),
+            // MediaType is #[non_exhaustive]: fall back to a neutral extension.
+            _ => ".bin",
         };
         let filename = weixin_agent::util::random::temp_file_name("download", ext);
         let dest = dir.join(&filename);
@@ -402,6 +538,7 @@ async fn main() -> anyhow::Result<()> {
             }
             println!("╠══════════════════════════════════════════╣");
             println!("║ Commands: ping echo typing info help     ║");
+            println!("║ New: toolcall runid refinfo              ║");
             println!("║ Media: 🖼️ 📄 🎬 🎤  Ref: 📎             ║");
             println!("╠══════════════════════════════════════════╣");
             println!(
