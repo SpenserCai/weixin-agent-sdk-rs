@@ -17,7 +17,7 @@ use crate::api::config_cache::ConfigCache;
 use crate::error::Result;
 use crate::messaging::inbound::SendResult;
 use crate::messaging::outbound_run::OutboundRun;
-use crate::types::MessageItem;
+use crate::types::{MessageItem, TypingStatus};
 
 /// Outbound sender shared by the client, message contexts, and outbound runs.
 pub struct MessageSender {
@@ -87,6 +87,21 @@ impl MessageSender {
         let message_id = req.msg.client_id.clone().unwrap_or_default();
         self.api.send_message(&req).await?;
         Ok(SendResult { message_id })
+    }
+
+    /// Set the typing indicator for a user — the single implementation shared
+    /// by [`crate::MessageContext`] and [`crate::WeixinClient`]. The ticket is
+    /// fetched/cached internally per user (24h TTL + jitter + backoff).
+    pub(crate) async fn set_typing(
+        &self,
+        to: &str,
+        context_token: Option<&str>,
+        status: TypingStatus,
+    ) -> Result<()> {
+        let ticket = self.config_cache.get_typing_ticket(to, context_token).await;
+        let req =
+            crate::messaging::send::build_typing_request(to, ticket, status, self.api.base_info());
+        self.api.send_typing(&req).await
     }
 
     /// Start an outbound run with an auto-generated run ID.

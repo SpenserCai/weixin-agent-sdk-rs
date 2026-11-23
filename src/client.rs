@@ -15,6 +15,7 @@ use crate::messaging::outbound_run::OutboundRun;
 use crate::messaging::sender::MessageSender;
 use crate::monitor::poll_loop::MessageHandler;
 use crate::qr_login::login::QrLoginApi;
+use crate::types::TypingStatus;
 
 /// The main SDK client.
 pub struct WeixinClient {
@@ -96,6 +97,31 @@ impl WeixinClient {
     ) -> Result<SendResult> {
         self.sender
             .send_media(to, file_path, context_token, None)
+            .await
+    }
+
+    /// Send a typing indicator to a user.
+    ///
+    /// The typing ticket is fetched and cached internally (per user, 24h TTL
+    /// with jitter and backoff) — callers never manage tickets. This is the
+    /// client-level counterpart of [`crate::MessageContext::send_typing`], for
+    /// driving the indicator outside the inbound callback (e.g. across an
+    /// agent turn's lifecycle: light on work start, refresh while busy,
+    /// cancel on completion). Refresh/cancel policy belongs to the caller;
+    /// this method performs exactly one protocol call.
+    pub async fn send_typing(&self, to: &str, context_token: Option<&str>) -> Result<()> {
+        self.sender
+            .set_typing(to, context_token, TypingStatus::Typing)
+            .await
+    }
+
+    /// Cancel the typing indicator for a user.
+    ///
+    /// Client-level counterpart of [`crate::MessageContext::cancel_typing`];
+    /// see [`Self::send_typing`] for ticket handling.
+    pub async fn cancel_typing(&self, to: &str, context_token: Option<&str>) -> Result<()> {
+        self.sender
+            .set_typing(to, context_token, TypingStatus::Cancel)
             .await
     }
 

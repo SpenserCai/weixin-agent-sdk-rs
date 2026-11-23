@@ -16,7 +16,8 @@
 //! # Commands (send via WeChat):
 //!   ping              → pong
 //!   echo <text>       → echo back
-//!   typing            → show typing 3s then reply
+//!   typing            → show typing 3s then reply (MessageContext API)
+//!   ctyping           → same via the client-level API (WeixinClient::send_typing)
 //!   info              → message details (debug)
 //!   toolcall          → mocked tool-call run: start → 2s work → result → final text
 //!   toolcall fail     → same, reporting Failed
@@ -36,6 +37,7 @@
 mod common;
 
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, OnceLock};
 use std::time::Duration;
 
 use clap::{Parser, Subcommand};
@@ -93,6 +95,10 @@ enum Command {
 struct E2eHandler {
     user_dir: PathBuf,
     download_dir: Option<PathBuf>,
+    /// The handler is handed to the builder before the client exists; the
+    /// slot is filled right after `build()` so commands can exercise the
+    /// client-level API (e.g. `ctyping`).
+    client: Arc<OnceLock<WeixinClient>>,
 }
 
 #[async_trait::async_trait]
@@ -187,6 +193,17 @@ impl E2eHandler {
                 ctx.cancel_typing().await?;
                 ctx.reply_text("✅ typing 测试完成").await?;
             }
+            "ctyping" => {
+                // Client-level typing: same protocol path as `typing`, but
+                // driven through WeixinClient — the entry point for turn
+                // lifecycle control outside the inbound callback.
+                let client = self.client.get().expect("client slot set before start");
+                let token = ctx.context_token.as_deref();
+                client.send_typing(&ctx.from, token).await?;
+                tokio::time::sleep(Duration::from_secs(3)).await;
+                client.cancel_typing(&ctx.from, token).await?;
+                ctx.reply_text("✅ ctyping（client 级）测试完成").await?;
+            }
             "info" => {
                 let info = format!(
                     "📋 消息详情\n\n\
@@ -240,6 +257,7 @@ impl E2eHandler {
                      • ping → pong\n\
                      • echo <文本> → 回声\n\
                      • typing → 输入状态测试\n\
+                     • ctyping → 输入状态测试（client 级 API）\n\
                      • info → 消息详情\n\
                      • toolcall [fail|blocked|multi|noid] → 工具调用进度流程\n\
                      • runid [same|split] → run_id 分组验证\n\
@@ -645,14 +663,17 @@ async fn run_user(
     }
     let config = builder.build()?;
 
+    let client_slot = Arc::new(OnceLock::new());
     let client = WeixinClient::builder(config)
         .on_message(E2eHandler {
             user_dir: user_dir.clone(),
             download_dir,
+            client: Arc::clone(&client_slot),
         })
         .build()?;
 
     client.context_tokens().import(ctx_tokens);
-    client.start(sync_buf).await?;
+    let _ = client_slot.set(client);
+    client_slot.get().unwrap().start(sync_buf).await?;
     Ok(())
 }

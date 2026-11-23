@@ -2,6 +2,16 @@
 
 本文件记录本 crate 的显著变更，格式参照 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)（`0.x` 的次版本位即破坏性位）。
 
+## [Unreleased]
+
+### 新增
+
+- **`WeixinClient::send_typing()` / `cancel_typing()`**：client 级输入状态接口，与 `MessageContext::send_typing()` / `cancel_typing()` 语义一致（`to` = 对方 ilink_user_id，`context_token` 可选关联）。用于在入站回调**之外**驱动 typing 的完整生命周期（开始工作时点亮、忙碌期间刷新、完成时取消）——此前 typing 仅能在 `on_message` 回调内调用，回调外无公开句柄。ticket 仍由内部 `ConfigCache` 按用户获取/缓存（24h TTL + 抖动 + 退避），调用方零感知；刷新/取消策略归调用方，本方法只执行一次协议调用。纯增补，无破坏。
+
+### 变更
+
+- `MessageContext::send_typing()` / `cancel_typing()` 改为委托新增的内部共享实现 `MessageSender::set_typing()`（请求构造收敛到 `messaging::send::build_typing_request`），消除双份内联构造；行为不变。
+
 ## [0.3.0] - 2026-08-13
 
 协议参照从 `@tencent-weixin/openclaw-weixin` v2.4.3 对齐到 v2.4.6。

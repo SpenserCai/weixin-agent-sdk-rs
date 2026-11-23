@@ -9,8 +9,8 @@ use dashmap::DashMap;
 use crate::error::Result;
 use crate::messaging::outbound_run::OutboundRun;
 use crate::types::{
-    CdnMedia, MediaType, MessageItem, MessageItemType, MessageState, MessageType,
-    SendTypingRequest, TypingStatus, WeixinMessage,
+    CdnMedia, MediaType, MessageItem, MessageItemType, MessageState, MessageType, TypingStatus,
+    WeixinMessage,
 };
 use crate::util::random::generate_id;
 
@@ -140,34 +140,24 @@ impl MessageContext {
 
     /// Send a typing indicator.
     pub async fn send_typing(&self) -> Result<()> {
-        let ticket = self
-            .sender
-            .config_cache
-            .get_typing_ticket(&self.from, self.context_token.as_deref())
-            .await;
-        let req = SendTypingRequest {
-            ilink_user_id: self.from.clone(),
-            typing_ticket: ticket,
-            status: TypingStatus::Typing,
-            base_info: self.sender.api.base_info(),
-        };
-        self.sender.api.send_typing(&req).await
+        self.sender
+            .set_typing(
+                &self.from,
+                self.context_token.as_deref(),
+                TypingStatus::Typing,
+            )
+            .await
     }
 
     /// Cancel the typing indicator.
     pub async fn cancel_typing(&self) -> Result<()> {
-        let ticket = self
-            .sender
-            .config_cache
-            .get_typing_ticket(&self.from, self.context_token.as_deref())
-            .await;
-        let req = SendTypingRequest {
-            ilink_user_id: self.from.clone(),
-            typing_ticket: ticket,
-            status: TypingStatus::Cancel,
-            base_info: self.sender.api.base_info(),
-        };
-        self.sender.api.send_typing(&req).await
+        self.sender
+            .set_typing(
+                &self.from,
+                self.context_token.as_deref(),
+                TypingStatus::Cancel,
+            )
+            .await
     }
 }
 
