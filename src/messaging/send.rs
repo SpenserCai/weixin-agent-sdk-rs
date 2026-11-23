@@ -7,7 +7,7 @@ use crate::error::Result;
 use crate::messaging::inbound::SendResult;
 use crate::types::{
     BaseInfo, MessageItem, MessageItemType, MessageState, MessageType, SendMessageRequest,
-    TextItem, WeixinMessage,
+    SendTypingRequest, TextItem, TypingStatus, WeixinMessage,
 };
 use crate::util::random::generate_id;
 
@@ -78,6 +78,24 @@ fn build_request(
             run_id: run_id.map(String::from),
             ..Default::default()
         },
+        base_info,
+    }
+}
+
+/// Build a `SendTypingRequest` for the typing indicator endpoint.
+///
+/// `typing_ticket` comes from `getConfig` (cached per user by the SDK);
+/// `None` is omitted on the wire and the server decides validity.
+pub(crate) fn build_typing_request(
+    to: &str,
+    typing_ticket: Option<String>,
+    status: TypingStatus,
+    base_info: BaseInfo,
+) -> SendTypingRequest {
+    SendTypingRequest {
+        ilink_user_id: to.to_owned(),
+        typing_ticket,
+        status,
         base_info,
     }
 }
@@ -218,5 +236,30 @@ mod tests {
         let req = build_item_message("u", item, None, None, build_base_info());
         let json = serde_json::to_string(&req).unwrap();
         assert!(json.contains("**bash**"));
+    }
+
+    #[test]
+    fn build_typing_request_shape() {
+        let req = build_typing_request(
+            "user123",
+            Some("ticket-abc".into()),
+            TypingStatus::Typing,
+            build_base_info(),
+        );
+        assert_eq!(req.ilink_user_id, "user123");
+        assert_eq!(req.typing_ticket.as_deref(), Some("ticket-abc"));
+        assert_eq!(req.status, TypingStatus::Typing);
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"status\":1"));
+    }
+
+    #[test]
+    fn build_typing_request_cancel_wire_value() {
+        let req = build_typing_request("u", None, TypingStatus::Cancel, build_base_info());
+        assert_eq!(req.status, TypingStatus::Cancel);
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("\"status\":2"));
+        // A missing ticket is omitted, not sent as null.
+        assert!(!json.contains("typing_ticket"));
     }
 }
